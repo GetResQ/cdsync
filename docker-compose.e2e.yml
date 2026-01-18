@@ -1,0 +1,28 @@
+services:
+  bigquery-emulator:
+    image: ghcr.io/goccy/bigquery-emulator:latest
+    platform: linux/amd64
+    command:
+      - "--project=cdsync"
+      - "--dataset=cdsync_e2e"
+      - "--port=9050"
+      - "--grpc-port=9051"
+    ports:
+      - "9050:9050"
+      - "9051:9051"
+
+  postgres:
+    image: postgres:16
+    profiles: ["itest"]
+    environment:
+      POSTGRES_USER: cdsync
+      POSTGRES_PASSWORD: cdsync
+      POSTGRES_DB: cdsync
+    ports:
+      - "5433:5432"
+    command: ["postgres", "-c", "wal_level=logical"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cdsync -d cdsync"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
