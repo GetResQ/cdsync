@@ -5,6 +5,21 @@ use serde::{Deserialize, Serialize};
 pub const META_SYNCED_AT: &str = "_cdsync_synced_at";
 pub const META_DELETED_AT: &str = "_cdsync_deleted_at";
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetadataColumns {
+    pub synced_at: String,
+    pub deleted_at: String,
+}
+
+impl Default for MetadataColumns {
+    fn default() -> Self {
+        Self {
+            synced_at: META_SYNCED_AT.to_string(),
+            deleted_at: META_DELETED_AT.to_string(),
+        }
+    }
+}
+
 pub fn destination_table_name(source_name: &str) -> String {
     source_name.replace('.', "__")
 }

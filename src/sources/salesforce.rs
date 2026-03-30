@@ -4,9 +4,7 @@ use crate::config::{
 use crate::destinations::{Destination, WriteMode};
 use crate::state::StateHandle;
 use crate::stats::StatsHandle;
-use crate::types::{
-    ColumnSchema, DataType, META_DELETED_AT, META_SYNCED_AT, TableCheckpoint, TableSchema,
-};
+use crate::types::{ColumnSchema, DataType, MetadataColumns, TableCheckpoint, TableSchema};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use globset::{Glob, GlobSet};
@@ -22,6 +20,7 @@ use tokio::time::sleep;
 
 pub struct SalesforceSource {
     config: SalesforceConfig,
+    metadata: MetadataColumns,
     client: Client,
     auth: Mutex<Option<AuthState>>,
 }
@@ -51,9 +50,10 @@ struct AuthState {
 }
 
 impl SalesforceSource {
-    pub fn new(config: SalesforceConfig) -> Result<Self> {
+    pub fn new(config: SalesforceConfig, metadata: MetadataColumns) -> Result<Self> {
         Ok(Self {
             config,
+            metadata,
             client: Client::new(),
             auth: Mutex::new(None),
         })
@@ -183,7 +183,13 @@ impl SalesforceSource {
             }
 
             let synced_at = Utc::now();
-            let frame = records_to_frame(&schema, &response.records, object, synced_at)?;
+            let frame = records_to_frame(
+                &schema,
+                &response.records,
+                object,
+                synced_at,
+                &self.metadata,
+            )?;
             if let Some(stats) = &stats {
                 stats
                     .record_extract(&object.name, response.records.len(), extract_ms)
@@ -516,7 +522,7 @@ fn ensure_field(fields: &mut Vec<String>, name: &str) {
     }
 }
 
-fn polars_schema_with_metadata(schema: &TableSchema) -> Schema {
+fn polars_schema_with_metadata(schema: &TableSchema, metadata: &MetadataColumns) -> Schema {
     let mut fields: Vec<Field> = Vec::with_capacity(schema.columns.len() + 2);
     for column in &schema.columns {
         let dtype = match column.data_type {
@@ -527,8 +533,14 @@ fn polars_schema_with_metadata(schema: &TableSchema) -> Schema {
         };
         fields.push(Field::new(column.name.as_str().into(), dtype));
     }
-    fields.push(Field::new(META_SYNCED_AT.into(), PolarsDataType::String));
-    fields.push(Field::new(META_DELETED_AT.into(), PolarsDataType::String));
+    fields.push(Field::new(
+        metadata.synced_at.as_str().into(),
+        PolarsDataType::String,
+    ));
+    fields.push(Field::new(
+        metadata.deleted_at.as_str().into(),
+        PolarsDataType::String,
+    ));
     Schema::from_iter(fields)
 }
 
@@ -537,8 +549,9 @@ fn records_to_frame(
     records: &[Map<String, Value>],
     object: &ResolvedSalesforceObject,
     synced_at: DateTime<Utc>,
+    metadata: &MetadataColumns,
 ) -> Result<DataFrame> {
-    let polars_schema = polars_schema_with_metadata(schema);
+    let polars_schema = polars_schema_with_metadata(schema, metadata);
     let mut rows: Vec<PolarsRow> = Vec::with_capacity(records.len());
     for record in records {
         let mut values: Vec<AnyValue> = Vec::with_capacity(polars_schema.len());

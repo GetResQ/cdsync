@@ -3,7 +3,7 @@ use cdsync::config::{BigQueryConfig, PostgresConfig, PostgresTableConfig, Schema
 use cdsync::destinations::bigquery::BigQueryDestination;
 use cdsync::sources::postgres::{CdcSyncRequest, PostgresSource, TableSyncRequest};
 use cdsync::state::ConnectionState;
-use cdsync::types::{SyncMode, destination_table_name};
+use cdsync::types::{MetadataColumns, SyncMode, destination_table_name};
 mod support;
 use sqlx::postgres::PgPoolOptions;
 use std::env;
@@ -99,9 +99,10 @@ async fn e2e_cdc_soft_delete_sets_deleted_at() -> Result<()> {
     support::delete_table_if_exists(&http_client, &bq_http, &project_id, &dataset, &dest_table)
         .await?;
 
-    let source = PostgresSource::new(pg_config.clone()).await?;
+    let source = PostgresSource::new(pg_config.clone(), MetadataColumns::default()).await?;
     let tables = source.resolve_tables().await?;
-    let dest = BigQueryDestination::new(bq_config.clone(), false).await?;
+    let dest =
+        BigQueryDestination::new(bq_config.clone(), false, MetadataColumns::default()).await?;
     dest.validate().await?;
 
     let mut state = ConnectionState::default();
@@ -242,9 +243,10 @@ async fn e2e_polling_soft_delete_sets_deleted_at() -> Result<()> {
     support::delete_table_if_exists(&http_client, &bq_http, &project_id, &dataset, &dest_table)
         .await?;
 
-    let source = PostgresSource::new(pg_config.clone()).await?;
+    let source = PostgresSource::new(pg_config.clone(), MetadataColumns::default()).await?;
     let tables = source.resolve_tables().await?;
-    let dest = BigQueryDestination::new(bq_config.clone(), false).await?;
+    let dest =
+        BigQueryDestination::new(bq_config.clone(), false, MetadataColumns::default()).await?;
     dest.validate().await?;
 
     let mut state = ConnectionState::default();
@@ -274,7 +276,7 @@ async fn e2e_polling_soft_delete_sets_deleted_at() -> Result<()> {
     .execute(&pool)
     .await?;
 
-    let source = PostgresSource::new(pg_config).await?;
+    let source = PostgresSource::new(pg_config, MetadataColumns::default()).await?;
     let tables = source.resolve_tables().await?;
     let checkpoint = source
         .sync_table(TableSyncRequest {

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::types::TableSchema;
+use crate::types::{MetadataColumns, TableSchema};
 use polars::prelude::DataFrame;
 
 pub mod bigquery;
@@ -30,24 +30,18 @@ pub trait Destination: Send + Sync {
     }
 }
 
-pub fn with_metadata_schema(schema: &TableSchema) -> TableSchema {
+pub fn with_metadata_schema(schema: &TableSchema, metadata: &MetadataColumns) -> TableSchema {
     let mut columns = schema.columns.clone();
-    if !columns
-        .iter()
-        .any(|c| c.name == crate::types::META_SYNCED_AT)
-    {
+    if !columns.iter().any(|c| c.name == metadata.synced_at) {
         columns.push(crate::types::ColumnSchema {
-            name: crate::types::META_SYNCED_AT.to_string(),
+            name: metadata.synced_at.clone(),
             data_type: crate::types::DataType::Timestamp,
             nullable: false,
         });
     }
-    if !columns
-        .iter()
-        .any(|c| c.name == crate::types::META_DELETED_AT)
-    {
+    if !columns.iter().any(|c| c.name == metadata.deleted_at) {
         columns.push(crate::types::ColumnSchema {
-            name: crate::types::META_DELETED_AT.to_string(),
+            name: metadata.deleted_at.clone(),
             data_type: crate::types::DataType::Timestamp,
             nullable: true,
         });

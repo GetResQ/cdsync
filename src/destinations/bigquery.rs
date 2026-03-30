@@ -1,6 +1,6 @@
 use crate::config::BigQueryConfig;
 use crate::destinations::{Destination, WriteMode, with_metadata_schema};
-use crate::types::{ColumnSchema, DataType, TableSchema};
+use crate::types::{ColumnSchema, DataType, MetadataColumns, TableSchema};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use base64::Engine;
@@ -43,6 +43,7 @@ pub struct BigQueryDestination {
     client: Client,
     config: BigQueryConfig,
     dry_run: bool,
+    metadata: MetadataColumns,
     storage_writers: Arc<Mutex<HashMap<String, Arc<StorageWriteTableWriter>>>>,
 }
 
@@ -62,7 +63,11 @@ struct StorageWriteTableWriter {
 }
 
 impl BigQueryDestination {
-    pub async fn new(mut config: BigQueryConfig, dry_run: bool) -> Result<Self> {
+    pub async fn new(
+        mut config: BigQueryConfig,
+        dry_run: bool,
+        metadata: MetadataColumns,
+    ) -> Result<Self> {
         if config.emulator_http.is_none() && config.emulator_grpc.is_some() {
             anyhow::bail!("bigquery.emulator_grpc requires emulator_http");
         }
@@ -116,6 +121,7 @@ impl BigQueryDestination {
             client,
             config,
             dry_run,
+            metadata,
             storage_writers: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -147,8 +153,8 @@ impl BigQueryDestination {
              MAX(`{synced}`) AS max_synced_at, \
              COUNTIF(`{deleted}` IS NOT NULL) AS deleted_rows \
              FROM `{project}.{dataset}.{table}`",
-            synced = crate::types::META_SYNCED_AT,
-            deleted = crate::types::META_DELETED_AT,
+            synced = self.metadata.synced_at,
+            deleted = self.metadata.deleted_at,
             project = self.config.project_id,
             dataset = self.config.dataset,
             table = table_id
@@ -284,7 +290,7 @@ impl BigQueryDestination {
             return Ok(false);
         }
 
-        let full_schema = with_metadata_schema(schema);
+        let full_schema = with_metadata_schema(schema, &self.metadata);
         if !supports_storage_write_schema(&full_schema) {
             warn!(
                 table = table_id,
@@ -381,7 +387,7 @@ impl BigQueryDestination {
         with_partition: bool,
     ) -> Result<()> {
         self.ensure_dataset().await?;
-        let schema = with_metadata_schema(schema);
+        let schema = with_metadata_schema(schema, &self.metadata);
         let desired_fields = bq_fields_from_schema(&schema.columns);
         let bq_schema = BqTableSchema {
             fields: desired_fields.clone(),
@@ -415,7 +421,7 @@ impl BigQueryDestination {
             if with_partition && self.config.partition_by_synced_at.unwrap_or(false) {
                 body["timePartitioning"] = json!({
                     "type": "DAY",
-                    "field": crate::types::META_SYNCED_AT
+                    "field": self.metadata.synced_at
                 });
             }
             let create_url = format!(
@@ -474,7 +480,7 @@ impl BigQueryDestination {
                         Some(TimePartitioning {
                             partition_type: TimePartitionType::Day,
                             expiration_ms: None,
-                            field: Some(crate::types::META_SYNCED_AT.to_string()),
+                            field: Some(self.metadata.synced_at.clone()),
                         })
                     } else {
                         None
@@ -581,7 +587,7 @@ impl BigQueryDestination {
             return Ok(());
         }
 
-        let schema = with_metadata_schema(schema);
+        let schema = with_metadata_schema(schema, &self.metadata);
         let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
         let updates: Vec<String> = columns
             .iter()
@@ -1083,6 +1089,8 @@ fn anyvalue_to_bytes(value: &AnyValue) -> Result<Vec<u8>> {
 
 fn timestamp_string_to_micros(value: &str) -> Result<i64> {
     let timestamp = DateTime::parse_from_rfc3339(value)
+        .or_else(|_| DateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f%#z"))
+        .or_else(|_| DateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%#z"))
         .with_context(|| format!("parsing timestamp {}", value))?
         .with_timezone(&Utc);
     Ok(timestamp.timestamp_micros())
@@ -1235,5 +1243,13 @@ mod storage_write_tests {
             validate_storage_write_response("items", &success).expect("append result"),
             None
         );
+    }
+
+    #[test]
+    fn timestamp_string_to_micros_accepts_postgres_style_timestamptz() {
+        let micros = timestamp_string_to_micros("2026-03-30 01:36:12.186373+00")
+            .expect("postgres timestamptz");
+        let dt = DateTime::<Utc>::from_timestamp_micros(micros).expect("valid micros");
+        assert_eq!(dt.to_rfc3339(), "2026-03-30T01:36:12.186373+00:00");
     }
 }

@@ -7,8 +7,8 @@ use crate::runner::ShutdownSignal;
 use crate::state::{ConnectionState, StateHandle};
 use crate::stats::StatsHandle;
 use crate::types::{
-    ColumnSchema, DataType, META_DELETED_AT, META_SYNCED_AT, RowBatch, SchemaFieldSnapshot,
-    TableCheckpoint, TableSchema,
+    ColumnSchema, DataType, MetadataColumns, RowBatch, SchemaFieldSnapshot, TableCheckpoint,
+    TableSchema,
 };
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -47,6 +47,7 @@ use uuid::Uuid;
 
 pub struct PostgresSource {
     config: PostgresConfig,
+    metadata: MetadataColumns,
     pool: PgPool,
 }
 
@@ -155,13 +156,17 @@ pub struct PostgresTableSummary {
 }
 
 impl PostgresSource {
-    pub async fn new(config: PostgresConfig) -> Result<Self> {
+    pub async fn new(config: PostgresConfig, metadata: MetadataColumns) -> Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(DEFAULT_PG_POOL_MAX)
             .connect(&config.url)
             .await
             .context("connecting to postgres")?;
-        Ok(Self { config, pool })
+        Ok(Self {
+            config,
+            metadata,
+            pool,
+        })
     }
 
     pub fn pool_max_connections(&self) -> u32 {
@@ -594,7 +599,7 @@ impl PostgresSource {
         for (table_id, table_cfg) in table_ids.iter() {
             let etl_schema = self.load_etl_table_schema(*table_id).await?;
             store.store_table_schema(etl_schema.clone()).await?;
-            let info = cdc_table_info_from_schema(table_cfg, &etl_schema)?;
+            let info = cdc_table_info_from_schema(table_cfg, &etl_schema, &self.metadata)?;
             dest.ensure_table(&info.schema).await?;
             let schema_hash = schema_fingerprint(&info.schema);
             let prev_snapshot = state
@@ -916,7 +921,7 @@ impl PostgresSource {
                 break;
             }
 
-            let batch = rows_to_batch(schema, &rows, table, Utc::now())?;
+            let batch = rows_to_batch(schema, &rows, table, Utc::now(), &self.metadata)?;
             if let Some(stats) = options.stats {
                 stats
                     .record_extract(&table.name, rows.len(), extract_ms)
@@ -1025,7 +1030,7 @@ impl PostgresSource {
             }
 
             let batch_synced_at = Utc::now();
-            let batch = rows_to_batch(schema, &rows, table, batch_synced_at)?;
+            let batch = rows_to_batch(schema, &rows, table, batch_synced_at, &self.metadata)?;
             if let Some(stats) = options.stats {
                 stats
                     .record_extract(&table.name, rows.len(), extract_ms)
@@ -1641,7 +1646,7 @@ impl PostgresSource {
 
         let etl_schema = self.load_etl_table_schema(table_id).await?;
         runtime.store.store_table_schema(etl_schema.clone()).await?;
-        let info = cdc_table_info_from_schema(table_cfg, &etl_schema)?;
+        let info = cdc_table_info_from_schema(table_cfg, &etl_schema, &self.metadata)?;
         let new_hash = schema_fingerprint(&info.schema);
         let prev_snapshot = runtime.table_snapshots.get(&table_id).cloned();
         if let Some(diff) = schema_diff(prev_snapshot.as_deref(), &info.schema)
@@ -1910,8 +1915,9 @@ fn rows_to_batch(
     rows: &[PgRow],
     table: &ResolvedPostgresTable,
     synced_at: DateTime<Utc>,
+    metadata: &MetadataColumns,
 ) -> Result<RowBatch> {
-    let polars_schema = polars_schema_with_metadata(schema)?;
+    let polars_schema = polars_schema_with_metadata(schema, metadata)?;
     let mut output: Vec<PolarsRow> = Vec::with_capacity(rows.len());
     for row in rows {
         let mut values: Vec<AnyValue> = Vec::with_capacity(polars_schema.len());
@@ -2097,7 +2103,7 @@ fn encode_base64(bytes: &[u8]) -> String {
     STANDARD.encode(bytes)
 }
 
-fn polars_schema_with_metadata(schema: &TableSchema) -> Result<Schema> {
+fn polars_schema_with_metadata(schema: &TableSchema, metadata: &MetadataColumns) -> Result<Schema> {
     let mut fields: Vec<Field> = Vec::with_capacity(schema.columns.len() + 2);
     for column in &schema.columns {
         let dtype = match column.data_type {
@@ -2108,8 +2114,14 @@ fn polars_schema_with_metadata(schema: &TableSchema) -> Result<Schema> {
         };
         fields.push(Field::new(column.name.as_str().into(), dtype));
     }
-    fields.push(Field::new(META_SYNCED_AT.into(), PolarsDataType::String));
-    fields.push(Field::new(META_DELETED_AT.into(), PolarsDataType::String));
+    fields.push(Field::new(
+        metadata.synced_at.as_str().into(),
+        PolarsDataType::String,
+    ));
+    fields.push(Field::new(
+        metadata.deleted_at.as_str().into(),
+        PolarsDataType::String,
+    ));
     Ok(Schema::from_iter(fields))
 }
 
@@ -2131,6 +2143,7 @@ fn pg_type_to_data_type_from_type(typ: &etl::types::Type) -> DataType {
 fn cdc_table_info_from_schema(
     table_cfg: &ResolvedPostgresTable,
     etl_schema: &EtlTableSchema,
+    metadata: &MetadataColumns,
 ) -> Result<CdcTableInfo> {
     let source_columns: Vec<ColumnSchema> = etl_schema
         .column_schemas
@@ -2170,6 +2183,7 @@ fn cdc_table_info_from_schema(
             source_name: etl_schema.name.to_string(),
             dest_name: schema.name.clone(),
             schema,
+            metadata: metadata.clone(),
             primary_key: table_cfg.primary_key.clone(),
             soft_delete: table_cfg.soft_delete,
             soft_delete_column: table_cfg.soft_delete_column.clone(),

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub connections: Vec<ConnectionConfig>,
     pub state: StateConfig,
+    pub metadata: Option<MetadataConfig>,
     pub logging: Option<LoggingConfig>,
     pub observability: Option<ObservabilityConfig>,
     pub sync: Option<SyncConfig>,
@@ -33,12 +34,31 @@ impl Config {
         Ok(())
     }
 
+    pub fn metadata_columns(&self) -> crate::types::MetadataColumns {
+        let mut metadata = crate::types::MetadataColumns::default();
+        if let Some(config) = &self.metadata {
+            if let Some(synced_at) = &config.synced_at_column {
+                metadata.synced_at = synced_at.clone();
+            }
+            if let Some(deleted_at) = &config.deleted_at_column {
+                metadata.deleted_at = deleted_at.clone();
+            }
+        }
+        metadata
+    }
+
     pub fn template(path: &Path) -> TemplateConfig {
         TemplateConfig {
             path: path.to_path_buf(),
             content: DEFAULT_TEMPLATE.to_string(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataConfig {
+    pub synced_at_column: Option<String>,
+    pub deleted_at_column: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -353,6 +373,10 @@ const DEFAULT_TEMPLATE: &str = r#"# CDSync configuration (YAML)
 state:
   path: "./cdsync_state.db"
 
+metadata:
+  synced_at_column: "_cdsync_synced_at"
+  deleted_at_column: "_cdsync_deleted_at"
+
 logging:
   level: "info"
   json: false
@@ -498,5 +522,33 @@ connections:
 "#;
         let cfg: Config = serde_yaml::from_str(raw).expect("config parses");
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn metadata_columns_override_defaults() {
+        let raw = r#"
+state:
+  path: "./state.db"
+metadata:
+  synced_at_column: "_synced_custom"
+  deleted_at_column: "_deleted_custom"
+connections:
+  - id: "app"
+    source:
+      type: postgres
+      url: "postgres://user:pass@host:5432/db"
+      cdc: false
+      tables:
+        - name: "public.accounts"
+          primary_key: "id"
+    destination:
+      type: bigquery
+      project_id: "proj"
+      dataset: "ds"
+"#;
+        let cfg: Config = serde_yaml::from_str(raw).expect("config parses");
+        let metadata = cfg.metadata_columns();
+        assert_eq!(metadata.synced_at, "_synced_custom");
+        assert_eq!(metadata.deleted_at, "_deleted_custom");
     }
 }

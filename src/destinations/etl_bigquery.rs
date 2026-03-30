@@ -1,7 +1,7 @@
 use crate::destinations::bigquery::BigQueryDestination;
 use crate::destinations::{Destination as CdsDestination, WriteMode};
 use crate::stats::StatsHandle;
-use crate::types::{DataType, META_DELETED_AT, META_SYNCED_AT, TableSchema};
+use crate::types::{DataType, MetadataColumns, TableSchema};
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -30,6 +30,7 @@ pub struct CdcTableInfo {
     pub source_name: String,
     pub dest_name: String,
     pub schema: TableSchema,
+    pub metadata: MetadataColumns,
     pub primary_key: String,
     pub soft_delete: bool,
     dest_source_indices: Vec<usize>,
@@ -42,6 +43,7 @@ pub struct CdcTableSpec {
     pub source_name: String,
     pub dest_name: String,
     pub schema: TableSchema,
+    pub metadata: MetadataColumns,
     pub primary_key: String,
     pub soft_delete: bool,
     pub soft_delete_column: Option<String>,
@@ -84,6 +86,7 @@ impl CdcTableInfo {
             source_name: spec.source_name,
             dest_name: spec.dest_name,
             schema: spec.schema,
+            metadata: spec.metadata,
             primary_key: spec.primary_key,
             soft_delete: spec.soft_delete,
             dest_source_indices,
@@ -336,7 +339,7 @@ fn table_rows_to_frame(
     synced_at: DateTime<Utc>,
     deleted_at_override: Option<DateTime<Utc>>,
 ) -> Result<DataFrame, EtlError> {
-    let polars_schema = polars_schema_with_metadata(&info.schema)?;
+    let polars_schema = polars_schema_with_metadata(&info.schema, &info.metadata)?;
     let mut output: Vec<PolarsRow> = Vec::with_capacity(rows.len());
     for row in rows {
         let mut values: Vec<AnyValue> = Vec::with_capacity(polars_schema.len());
@@ -582,7 +585,10 @@ fn array_to_json(array: &etl::types::ArrayCell) -> serde_json::Value {
     }
 }
 
-fn polars_schema_with_metadata(schema: &TableSchema) -> EtlResult<Schema> {
+fn polars_schema_with_metadata(
+    schema: &TableSchema,
+    metadata: &MetadataColumns,
+) -> EtlResult<Schema> {
     let mut fields: Vec<Field> = Vec::with_capacity(schema.columns.len() + 2);
     for column in &schema.columns {
         let dtype = match column.data_type {
@@ -593,8 +599,14 @@ fn polars_schema_with_metadata(schema: &TableSchema) -> EtlResult<Schema> {
         };
         fields.push(Field::new(column.name.as_str().into(), dtype));
     }
-    fields.push(Field::new(META_SYNCED_AT.into(), PolarsDataType::String));
-    fields.push(Field::new(META_DELETED_AT.into(), PolarsDataType::String));
+    fields.push(Field::new(
+        metadata.synced_at.as_str().into(),
+        PolarsDataType::String,
+    ));
+    fields.push(Field::new(
+        metadata.deleted_at.as_str().into(),
+        PolarsDataType::String,
+    ));
     Ok(Schema::from_iter(fields))
 }
 
@@ -648,6 +660,7 @@ mod tests {
                 source_name: "public.items".to_string(),
                 dest_name: "public__items".to_string(),
                 schema,
+                metadata: MetadataColumns::default(),
                 primary_key: "id".to_string(),
                 soft_delete: true,
                 soft_delete_column: Some("deleted_at".to_string()),

@@ -97,6 +97,7 @@ struct SyncConnectionRequest<'a> {
     connection: &'a crate::config::ConnectionConfig,
     state: &'a mut ConnectionState,
     state_handle: crate::state::StateHandle,
+    metadata: crate::types::MetadataColumns,
     mode: SyncMode,
     dry_run: bool,
     follow: bool,
@@ -216,6 +217,7 @@ async fn cmd_init(config_path: PathBuf) -> Result<()> {
 
     let cfg = Config::load(&config_path).await?;
     let _telemetry = telemetry::init(cfg.logging.as_ref(), cfg.observability.as_ref())?;
+    let metadata = cfg.metadata_columns();
 
     for connection in &cfg.connections {
         if !connection.enabled() {
@@ -223,7 +225,7 @@ async fn cmd_init(config_path: PathBuf) -> Result<()> {
         }
         match &connection.source {
             SourceConfig::Postgres(pg) => {
-                let source = PostgresSource::new(pg.clone()).await?;
+                let source = PostgresSource::new(pg.clone(), metadata.clone()).await?;
                 let tables = source.resolve_tables().await?;
                 for table in &tables {
                     let schema = source.discover_schema(table).await?;
@@ -235,14 +237,14 @@ async fn cmd_init(config_path: PathBuf) -> Result<()> {
                 }
             }
             SourceConfig::Salesforce(sf) => {
-                let source = SalesforceSource::new(sf.clone())?;
+                let source = SalesforceSource::new(sf.clone(), metadata.clone())?;
                 source.validate().await?;
             }
         }
 
         match &connection.destination {
             DestinationConfig::BigQuery(bq) => {
-                let dest = BigQueryDestination::new(bq.clone(), false).await?;
+                let dest = BigQueryDestination::new(bq.clone(), false, metadata.clone()).await?;
                 dest.validate().await?;
             }
         }
@@ -265,6 +267,7 @@ async fn cmd_sync(request: SyncCommandRequest) -> Result<()> {
     } = request;
     let cfg = Config::load(&config_path).await?;
     let _telemetry = telemetry::init(cfg.logging.as_ref(), cfg.observability.as_ref())?;
+    let metadata = cfg.metadata_columns();
 
     if follow && connection_filter.is_none() {
         anyhow::bail!("--follow requires --connection for a single postgres CDC connection");
@@ -331,6 +334,7 @@ async fn cmd_sync(request: SyncCommandRequest) -> Result<()> {
             connection,
             state: connection_state,
             state_handle: state_handle.clone(),
+            metadata: metadata.clone(),
             mode,
             dry_run,
             follow,
@@ -390,6 +394,7 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
         connection,
         state,
         state_handle,
+        metadata,
         mode,
         dry_run,
         follow,
@@ -402,13 +407,15 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
         shutdown,
     } = request;
     let dest = match &connection.destination {
-        DestinationConfig::BigQuery(bq) => BigQueryDestination::new(bq.clone(), dry_run).await?,
+        DestinationConfig::BigQuery(bq) => {
+            BigQueryDestination::new(bq.clone(), dry_run, metadata.clone()).await?
+        }
     };
     dest.validate().await?;
 
     match &connection.source {
         SourceConfig::Postgres(pg) => {
-            let source = PostgresSource::new(pg.clone()).await?;
+            let source = PostgresSource::new(pg.clone(), metadata.clone()).await?;
             let tables = source.resolve_tables().await?;
             if follow && !source.cdc_enabled() {
                 anyhow::bail!("--follow requires postgres.cdc=true");
@@ -537,7 +544,7 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
             if follow {
                 anyhow::bail!("--follow is only supported for postgres CDC connections");
             }
-            let source = SalesforceSource::new(sf.clone())?;
+            let source = SalesforceSource::new(sf.clone(), metadata.clone())?;
             let objects = source.resolve_objects().await?;
             let source = Arc::new(source);
             let dest = Arc::new(dest);
@@ -705,6 +712,7 @@ async fn cmd_validate(
 ) -> Result<()> {
     let cfg = Config::load(&config_path).await?;
     let _telemetry = telemetry::init(cfg.logging.as_ref(), cfg.observability.as_ref())?;
+    let metadata = cfg.metadata_columns();
 
     let mut matched = false;
     for connection in &cfg.connections {
@@ -721,7 +729,7 @@ async fn cmd_validate(
 
         match &connection.source {
             SourceConfig::Postgres(pg) => {
-                let source = PostgresSource::new(pg.clone()).await?;
+                let source = PostgresSource::new(pg.clone(), metadata.clone()).await?;
                 if source.cdc_enabled() {
                     let tables = source.resolve_tables().await?;
                     source.validate_cdc_publication(&tables, verbose).await?;
@@ -784,6 +792,7 @@ async fn cmd_reconcile(
 ) -> Result<()> {
     let cfg = Config::load(&config_path).await?;
     let _telemetry = telemetry::init(cfg.logging.as_ref(), cfg.observability.as_ref())?;
+    let metadata = cfg.metadata_columns();
 
     let connection = cfg
         .connections
@@ -793,8 +802,8 @@ async fn cmd_reconcile(
 
     let output = match (&connection.source, &connection.destination) {
         (SourceConfig::Postgres(pg), DestinationConfig::BigQuery(bq)) => {
-            let source = PostgresSource::new(pg.clone()).await?;
-            let dest = BigQueryDestination::new(bq.clone(), false).await?;
+            let source = PostgresSource::new(pg.clone(), metadata.clone()).await?;
+            let dest = BigQueryDestination::new(bq.clone(), false, metadata.clone()).await?;
             let tables = source.resolve_tables().await?;
             let selected_tables: Vec<_> = if let Some(table_filter) = &table_filter {
                 tables

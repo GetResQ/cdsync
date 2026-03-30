@@ -3,7 +3,7 @@ use cdsync::config::{BigQueryConfig, PostgresConfig, PostgresTableConfig, Schema
 use cdsync::destinations::bigquery::BigQueryDestination;
 use cdsync::sources::postgres::{CdcSyncRequest, PostgresSource};
 use cdsync::state::ConnectionState;
-use cdsync::types::{SyncMode, destination_table_name};
+use cdsync::types::{MetadataColumns, SyncMode, destination_table_name};
 mod support;
 use chrono::Utc;
 use sqlx::postgres::PgPoolOptions;
@@ -96,9 +96,9 @@ async fn e2e_postgres_cdc_snapshot_with_row_filter() -> Result<()> {
         emulator_grpc: Some(bq_grpc.clone()),
     };
 
-    let source = PostgresSource::new(pg_config).await?;
+    let source = PostgresSource::new(pg_config, MetadataColumns::default()).await?;
     let tables = source.resolve_tables().await?;
-    let dest = BigQueryDestination::new(bq_config, false).await?;
+    let dest = BigQueryDestination::new(bq_config, false, MetadataColumns::default()).await?;
     dest.validate().await?;
 
     let mut state = ConnectionState::default();

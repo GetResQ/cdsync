@@ -5,7 +5,7 @@ use cdsync::sources::salesforce::{
     ResolvedSalesforceObject, SalesforceSource, SalesforceSyncRequest,
 };
 use cdsync::types::TableCheckpoint;
-use cdsync::types::{SyncMode, TableSchema};
+use cdsync::types::{MetadataColumns, SyncMode, TableSchema};
 use polars::prelude::DataFrame;
 use std::sync::{
     Arc,
@@ -105,7 +105,7 @@ async fn salesforce_retries_on_rate_limit() -> anyhow::Result<()> {
         }),
     };
 
-    let source = SalesforceSource::new(config)?;
+    let source = SalesforceSource::new(config, MetadataColumns::default())?;
     let object = ResolvedSalesforceObject {
         name: "Account".to_string(),
         primary_key: "Id".to_string(),
