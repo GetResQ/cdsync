@@ -1,5 +1,6 @@
 use crate::config::{
-    ColumnSelection, PostgresConfig, PostgresTableConfig, PostgresTableDefaults, SchemaChangePolicy,
+    ColumnSelection, PostgresConfig, PostgresTableConfig, PostgresTableDefaults,
+    SchemaChangePolicy, TableSelectionConfig,
 };
 use crate::destinations::etl_bigquery::{CdcTableInfo, EtlBigQueryDestination};
 use crate::destinations::{Destination, WriteMode};
@@ -7,8 +8,7 @@ use crate::runner::ShutdownSignal;
 use crate::state::{ConnectionState, StateHandle};
 use crate::stats::StatsHandle;
 use crate::types::{
-    ColumnSchema, DataType, MetadataColumns, RowBatch, SchemaFieldSnapshot, TableCheckpoint,
-    TableSchema,
+    ColumnSchema, DataType, MetadataColumns, SchemaFieldSnapshot, TableCheckpoint, TableSchema,
 };
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -208,50 +208,21 @@ impl PostgresSource {
     }
 
     pub async fn resolve_tables(&self) -> Result<Vec<ResolvedPostgresTable>> {
-        let mut table_map: HashMap<String, PostgresTableConfig> = HashMap::new();
-
-        if let Some(tables) = &self.config.tables {
-            for table in tables {
-                table_map.insert(table.name.clone(), table.clone());
-            }
-        }
-
-        if let Some(selection) = &self.config.table_selection {
-            if !selection.include.is_empty() || !selection.exclude.is_empty() {
-                let all_tables = self.discover_table_names().await?;
-                let include_set = build_globset(&selection.include)?;
-                let exclude_set = build_globset(&selection.exclude)?;
-
-                for name in all_tables {
-                    if !selection.include.is_empty() && !include_set.is_match(&name) {
-                        continue;
-                    }
-                    if !selection.exclude.is_empty() && exclude_set.is_match(&name) {
-                        continue;
-                    }
-                    table_map
-                        .entry(name.clone())
-                        .or_insert(PostgresTableConfig {
-                            name,
-                            primary_key: None,
-                            updated_at_column: None,
-                            soft_delete: None,
-                            soft_delete_column: None,
-                            where_clause: None,
-                            columns: None,
-                        });
-                }
-            }
-
-            if !selection.exclude.is_empty() {
-                let exclude_set = build_globset(&selection.exclude)?;
-                table_map.retain(|name, _| !exclude_set.is_match(name));
-            }
-        }
-
-        if table_map.is_empty() {
-            anyhow::bail!("no postgres tables resolved from config");
-        }
+        let discovered_names = if self
+            .config
+            .table_selection
+            .as_ref()
+            .is_some_and(|selection| !selection.include.is_empty() || !selection.exclude.is_empty())
+        {
+            self.discover_table_names().await?
+        } else {
+            Vec::new()
+        };
+        let table_configs = collect_table_configs(
+            self.config.tables.as_deref(),
+            self.config.table_selection.as_ref(),
+            &discovered_names,
+        )?;
 
         let defaults = self
             .config
@@ -259,8 +230,8 @@ impl PostgresSource {
             .as_ref()
             .and_then(|sel| sel.defaults.clone());
 
-        let mut resolved = Vec::with_capacity(table_map.len());
-        for table_cfg in table_map.values() {
+        let mut resolved = Vec::with_capacity(table_configs.len());
+        for table_cfg in &table_configs {
             resolved.push(
                 self.apply_table_defaults(table_cfg, defaults.as_ref())
                     .await?,
@@ -932,7 +903,7 @@ impl PostgresSource {
                 dest.write_batch(
                     &schema.name,
                     schema,
-                    &batch.frame,
+                    &batch,
                     WriteMode::Append,
                     Some(&table.primary_key),
                 )
@@ -1041,7 +1012,7 @@ impl PostgresSource {
                 dest.write_batch(
                     &schema.name,
                     schema,
-                    &batch.frame,
+                    &batch,
                     WriteMode::Upsert,
                     Some(&table.primary_key),
                 )
@@ -1848,6 +1819,60 @@ fn build_globset(patterns: &[String]) -> Result<GlobSet> {
     Ok(builder.build()?)
 }
 
+fn collect_table_configs(
+    explicit_tables: Option<&[PostgresTableConfig]>,
+    selection: Option<&TableSelectionConfig>,
+    discovered_names: &[String],
+) -> Result<Vec<PostgresTableConfig>> {
+    let mut table_map: HashMap<String, PostgresTableConfig> = HashMap::new();
+
+    if let Some(tables) = explicit_tables {
+        for table in tables {
+            table_map.insert(table.name.clone(), table.clone());
+        }
+    }
+
+    if let Some(selection) = selection {
+        if !selection.include.is_empty() || !selection.exclude.is_empty() {
+            let include_set = build_globset(&selection.include)?;
+            let exclude_set = build_globset(&selection.exclude)?;
+
+            for name in discovered_names {
+                if !selection.include.is_empty() && !include_set.is_match(name) {
+                    continue;
+                }
+                if !selection.exclude.is_empty() && exclude_set.is_match(name) {
+                    continue;
+                }
+                table_map
+                    .entry(name.clone())
+                    .or_insert(PostgresTableConfig {
+                        name: name.clone(),
+                        primary_key: None,
+                        updated_at_column: None,
+                        soft_delete: None,
+                        soft_delete_column: None,
+                        where_clause: None,
+                        columns: None,
+                    });
+            }
+        }
+
+        if !selection.exclude.is_empty() {
+            let exclude_set = build_globset(&selection.exclude)?;
+            table_map.retain(|name, _| !exclude_set.is_match(name));
+        }
+    }
+
+    if table_map.is_empty() {
+        anyhow::bail!("no postgres tables resolved from config");
+    }
+
+    let mut table_configs: Vec<PostgresTableConfig> = table_map.into_values().collect();
+    table_configs.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(table_configs)
+}
+
 fn required_columns(table: &ResolvedPostgresTable) -> HashSet<String> {
     let mut required = HashSet::new();
     required.insert(table.primary_key.clone());
@@ -1916,7 +1941,7 @@ fn rows_to_batch(
     table: &ResolvedPostgresTable,
     synced_at: DateTime<Utc>,
     metadata: &MetadataColumns,
-) -> Result<RowBatch> {
+) -> Result<DataFrame> {
     let polars_schema = polars_schema_with_metadata(schema, metadata)?;
     let mut output: Vec<PolarsRow> = Vec::with_capacity(rows.len());
     for row in rows {
@@ -1937,12 +1962,7 @@ fn rows_to_batch(
         output.push(PolarsRow::new(values));
     }
 
-    let frame = DataFrame::from_rows_and_schema(&output, &polars_schema)?;
-    Ok(RowBatch {
-        table: schema.name.clone(),
-        schema: schema.clone(),
-        frame,
-    })
+    DataFrame::from_rows_and_schema(&output, &polars_schema).map_err(Into::into)
 }
 
 fn derive_deleted_at(row: &PgRow, table: &ResolvedPostgresTable) -> Option<Value> {
@@ -2373,6 +2393,68 @@ mod tests {
         let filtered = filter_columns(&all_columns, &selection, &required);
         let names: Vec<&str> = filtered.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["id", "name", "updated_at"]);
+    }
+
+    #[test]
+    fn collect_table_configs_applies_include_and_exclude_patterns() {
+        let selection = TableSelectionConfig {
+            include: vec!["public.*".to_string()],
+            exclude: vec!["public.audit_*".to_string()],
+            defaults: None,
+        };
+
+        let configs = collect_table_configs(
+            None,
+            Some(&selection),
+            &[
+                "public.accounts".to_string(),
+                "public.audit_log".to_string(),
+                "analytics.events".to_string(),
+            ],
+        )
+        .expect("table configs");
+
+        let names: Vec<&str> = configs.iter().map(|config| config.name.as_str()).collect();
+        assert_eq!(names, vec!["public.accounts"]);
+    }
+
+    #[test]
+    fn collect_table_configs_preserves_explicit_table_settings() {
+        let selection = TableSelectionConfig {
+            include: vec!["public.*".to_string()],
+            exclude: Vec::new(),
+            defaults: None,
+        };
+        let explicit_table = PostgresTableConfig {
+            name: "public.accounts".to_string(),
+            primary_key: Some("account_id".to_string()),
+            updated_at_column: Some("modified_at".to_string()),
+            soft_delete: Some(true),
+            soft_delete_column: Some("deleted_at".to_string()),
+            where_clause: Some("tenant_id = 42".to_string()),
+            columns: Some(ColumnSelection {
+                include: vec!["account_id".to_string(), "modified_at".to_string()],
+                exclude: Vec::new(),
+            }),
+        };
+
+        let configs = collect_table_configs(
+            Some(std::slice::from_ref(&explicit_table)),
+            Some(&selection),
+            &["public.accounts".to_string(), "public.orders".to_string()],
+        )
+        .expect("table configs");
+
+        let accounts = configs
+            .iter()
+            .find(|config| config.name == "public.accounts")
+            .expect("accounts config");
+        assert_eq!(accounts.primary_key.as_deref(), Some("account_id"));
+        assert_eq!(accounts.updated_at_column.as_deref(), Some("modified_at"));
+        assert_eq!(accounts.where_clause.as_deref(), Some("tenant_id = 42"));
+
+        let names: Vec<&str> = configs.iter().map(|config| config.name.as_str()).collect();
+        assert_eq!(names, vec!["public.accounts", "public.orders"]);
     }
 
     #[test]

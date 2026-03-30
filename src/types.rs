@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use polars::prelude::DataFrame;
 use serde::{Deserialize, Serialize};
 
 pub const META_SYNCED_AT: &str = "_cdsync_synced_at";
@@ -62,14 +61,6 @@ pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnSchema>,
     pub primary_key: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct RowBatch {
-    pub table: String,
-    pub schema: TableSchema,
-    pub frame: DataFrame,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

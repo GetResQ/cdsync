@@ -4,14 +4,20 @@ use cdsync::destinations::bigquery::BigQueryDestination;
 use cdsync::sources::postgres::{CdcSyncRequest, PostgresSource, TableSyncRequest};
 use cdsync::state::ConnectionState;
 use cdsync::types::{MetadataColumns, SyncMode, destination_table_name};
-mod support;
 use sqlx::postgres::PgPoolOptions;
 use std::env;
 use uuid::Uuid;
+#[path = "support/dotenv.rs"]
+mod dotenv_support;
+#[path = "support/emulator_delete.rs"]
+mod emulator_delete_support;
+#[path = "support/emulator_read.rs"]
+mod emulator_read_support;
 
 #[tokio::test]
 #[ignore]
 async fn e2e_cdc_soft_delete_sets_deleted_at() -> Result<()> {
+    dotenv_support::load_dotenv()?;
     let pg_url = env::var("CDSYNC_E2E_PG_URL")
         .context("set CDSYNC_E2E_PG_URL to a Postgres connection string")?;
     let bq_http = env::var("CDSYNC_E2E_BQ_HTTP")
@@ -96,8 +102,14 @@ async fn e2e_cdc_soft_delete_sets_deleted_at() -> Result<()> {
     };
 
     let http_client = reqwest::Client::new();
-    support::delete_table_if_exists(&http_client, &bq_http, &project_id, &dataset, &dest_table)
-        .await?;
+    emulator_delete_support::delete_table_if_exists(
+        &http_client,
+        &bq_http,
+        &project_id,
+        &dataset,
+        &dest_table,
+    )
+    .await?;
 
     let source = PostgresSource::new(pg_config.clone(), MetadataColumns::default()).await?;
     let tables = source.resolve_tables().await?;
@@ -142,17 +154,29 @@ async fn e2e_cdc_soft_delete_sets_deleted_at() -> Result<()> {
         })
         .await?;
 
-    let fields =
-        support::fetch_table_fields(&http_client, &bq_http, &project_id, &dataset, &dest_table)
-            .await?;
-    let rows =
-        support::fetch_table_rows(&http_client, &bq_http, &project_id, &dataset, &dest_table)
-            .await?;
-    let mapped = support::map_rows(&fields, rows)?;
+    let fields = emulator_read_support::fetch_table_fields(
+        &http_client,
+        &bq_http,
+        &project_id,
+        &dataset,
+        &dest_table,
+    )
+    .await?;
+    let rows = emulator_read_support::fetch_table_rows(
+        &http_client,
+        &bq_http,
+        &project_id,
+        &dataset,
+        &dest_table,
+    )
+    .await?;
+    let mapped = emulator_read_support::map_rows(&fields, rows)?;
 
     let deleted_rows: Vec<_> = mapped
         .iter()
-        .filter(|row| support::value_to_string(row.get("id").unwrap()) == Some("1".to_string()))
+        .filter(|row| {
+            emulator_read_support::value_to_string(row.get("id").unwrap()) == Some("1".to_string())
+        })
         .collect();
     anyhow::ensure!(!deleted_rows.is_empty(), "missing deleted row");
     let has_deleted_at = deleted_rows.iter().any(|row| {
@@ -167,6 +191,7 @@ async fn e2e_cdc_soft_delete_sets_deleted_at() -> Result<()> {
 #[tokio::test]
 #[ignore]
 async fn e2e_polling_soft_delete_sets_deleted_at() -> Result<()> {
+    dotenv_support::load_dotenv()?;
     let pg_url = env::var("CDSYNC_E2E_PG_URL")
         .context("set CDSYNC_E2E_PG_URL to a Postgres connection string")?;
     let bq_http = env::var("CDSYNC_E2E_BQ_HTTP")
@@ -240,8 +265,14 @@ async fn e2e_polling_soft_delete_sets_deleted_at() -> Result<()> {
     };
 
     let http_client = reqwest::Client::new();
-    support::delete_table_if_exists(&http_client, &bq_http, &project_id, &dataset, &dest_table)
-        .await?;
+    emulator_delete_support::delete_table_if_exists(
+        &http_client,
+        &bq_http,
+        &project_id,
+        &dataset,
+        &dest_table,
+    )
+    .await?;
 
     let source = PostgresSource::new(pg_config.clone(), MetadataColumns::default()).await?;
     let tables = source.resolve_tables().await?;
@@ -297,17 +328,29 @@ async fn e2e_polling_soft_delete_sets_deleted_at() -> Result<()> {
         .await?;
     state.postgres.insert(qualified_table.clone(), checkpoint);
 
-    let fields =
-        support::fetch_table_fields(&http_client, &bq_http, &project_id, &dataset, &dest_table)
-            .await?;
-    let rows =
-        support::fetch_table_rows(&http_client, &bq_http, &project_id, &dataset, &dest_table)
-            .await?;
-    let mapped = support::map_rows(&fields, rows)?;
+    let fields = emulator_read_support::fetch_table_fields(
+        &http_client,
+        &bq_http,
+        &project_id,
+        &dataset,
+        &dest_table,
+    )
+    .await?;
+    let rows = emulator_read_support::fetch_table_rows(
+        &http_client,
+        &bq_http,
+        &project_id,
+        &dataset,
+        &dest_table,
+    )
+    .await?;
+    let mapped = emulator_read_support::map_rows(&fields, rows)?;
 
     let deleted_rows: Vec<_> = mapped
         .iter()
-        .filter(|row| support::value_to_string(row.get("id").unwrap()) == Some("1".to_string()))
+        .filter(|row| {
+            emulator_read_support::value_to_string(row.get("id").unwrap()) == Some("1".to_string())
+        })
         .collect();
     anyhow::ensure!(!deleted_rows.is_empty(), "missing deleted row");
     let has_deleted_at = deleted_rows.iter().any(|row| {

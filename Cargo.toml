@@ -11,6 +11,7 @@ bigdecimal = "0.4"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
 etl = { git = "https://github.com/supabase/etl", package = "etl", default-features = false }
 etl-postgres = { git = "https://github.com/supabase/etl", package = "etl-postgres", default-features = false, features = ["replication"] }
 futures = "0.3"

@@ -4,15 +4,19 @@ use cdsync::destinations::bigquery::BigQueryDestination;
 use cdsync::sources::postgres::{CdcSyncRequest, PostgresSource};
 use cdsync::state::ConnectionState;
 use cdsync::types::{MetadataColumns, SyncMode, destination_table_name};
-mod support;
 use chrono::Utc;
 use sqlx::postgres::PgPoolOptions;
 use std::env;
 use uuid::Uuid;
+#[path = "support/dotenv.rs"]
+mod dotenv_support;
+#[path = "support/emulator_read.rs"]
+mod emulator_read_support;
 
 #[tokio::test]
 #[ignore]
 async fn e2e_postgres_cdc_snapshot_with_row_filter() -> Result<()> {
+    dotenv_support::load_dotenv()?;
     let pg_url = env::var("CDSYNC_E2E_PG_URL")
         .context("set CDSYNC_E2E_PG_URL to a Postgres connection string")?;
     let bq_http = env::var("CDSYNC_E2E_BQ_HTTP")
@@ -119,19 +123,29 @@ async fn e2e_postgres_cdc_snapshot_with_row_filter() -> Result<()> {
         .await?;
 
     let http_client = reqwest::Client::new();
-    let fields =
-        support::fetch_table_fields(&http_client, &bq_http, &project_id, &dataset, &dest_table)
-            .await?;
-    let rows =
-        support::fetch_table_rows(&http_client, &bq_http, &project_id, &dataset, &dest_table)
-            .await?;
-    let mapped = support::map_rows(&fields, rows)?;
+    let fields = emulator_read_support::fetch_table_fields(
+        &http_client,
+        &bq_http,
+        &project_id,
+        &dataset,
+        &dest_table,
+    )
+    .await?;
+    let rows = emulator_read_support::fetch_table_rows(
+        &http_client,
+        &bq_http,
+        &project_id,
+        &dataset,
+        &dest_table,
+    )
+    .await?;
+    let mapped = emulator_read_support::map_rows(&fields, rows)?;
 
     assert_eq!(mapped.len(), 2);
     let tenant_values: Vec<String> = mapped
         .iter()
         .filter_map(|row| row.get("tenant_id"))
-        .filter_map(support::value_to_string)
+        .filter_map(emulator_read_support::value_to_string)
         .collect();
     assert!(tenant_values.iter().all(|v| v == "1"));
     for row in &mapped {

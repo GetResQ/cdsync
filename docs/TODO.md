@@ -37,6 +37,7 @@
 - [x] Auth via service account JSON or env.
 - [x] Auto-create/alter tables based on source schema.
 - [x] Add metadata columns `_cdsync_synced_at`, `_cdsync_deleted_at`.
+- [x] Make metadata column names configurable.
 - [x] Upsert load path (MERGE on primary key); streaming insert for incremental batches.
 - [x] Optional partitioning by `_cdsync_synced_at` (configurable).
 
@@ -58,6 +59,8 @@
 - [x] Unit tests for type mapping and config parsing.
 - [x] Integration tests with dockerized Postgres and BigQuery emulator.
 - [x] Salesforce API mock tests.
+- [x] Real BigQuery heavy polling/incremental integration test.
+- [x] Real BigQuery heavy CDC integration test.
 
 ## 8. Reporting + Observability
 - [x] Add `report` command for recent run history.

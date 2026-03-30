@@ -24,10 +24,6 @@ pub trait Destination: Send + Sync {
         mode: WriteMode,
         primary_key: Option<&str>,
     ) -> anyhow::Result<()>;
-    #[allow(dead_code)]
-    async fn finalize_table(&self, _table: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
 }
 
 pub fn with_metadata_schema(schema: &TableSchema, metadata: &MetadataColumns) -> TableSchema {

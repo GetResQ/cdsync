@@ -4,14 +4,20 @@ use cdsync::destinations::bigquery::BigQueryDestination;
 use cdsync::sources::postgres::{PostgresSource, TableSyncRequest};
 use cdsync::state::ConnectionState;
 use cdsync::types::{MetadataColumns, SyncMode, destination_table_name};
-mod support;
 use sqlx::postgres::PgPoolOptions;
 use std::env;
 use uuid::Uuid;
+#[path = "support/dotenv.rs"]
+mod dotenv_support;
+#[path = "support/emulator_delete.rs"]
+mod emulator_delete_support;
+#[path = "support/emulator_read.rs"]
+mod emulator_read_support;
 
 #[tokio::test]
 #[ignore]
 async fn e2e_schema_addition_auto_alters_destination() -> Result<()> {
+    dotenv_support::load_dotenv()?;
     let pg_url = env::var("CDSYNC_E2E_PG_URL")
         .context("set CDSYNC_E2E_PG_URL to a Postgres connection string")?;
     let bq_http = env::var("CDSYNC_E2E_BQ_HTTP")
@@ -26,8 +32,14 @@ async fn e2e_schema_addition_auto_alters_destination() -> Result<()> {
     let qualified_table = format!("public.{table_name}");
     let dest_table = destination_table_name(&qualified_table);
     let http_client = reqwest::Client::new();
-    support::delete_table_if_exists(&http_client, &bq_http, &project_id, &dataset, &dest_table)
-        .await?;
+    emulator_delete_support::delete_table_if_exists(
+        &http_client,
+        &bq_http,
+        &project_id,
+        &dataset,
+        &dest_table,
+    )
+    .await?;
 
     let pool = PgPoolOptions::new()
         .max_connections(1)
@@ -147,20 +159,32 @@ async fn e2e_schema_addition_auto_alters_destination() -> Result<()> {
         .await?;
     state.postgres.insert(qualified_table.clone(), checkpoint);
 
-    let fields =
-        support::fetch_table_fields(&http_client, &bq_http, &project_id, &dataset, &dest_table)
-            .await?;
+    let fields = emulator_read_support::fetch_table_fields(
+        &http_client,
+        &bq_http,
+        &project_id,
+        &dataset,
+        &dest_table,
+    )
+    .await?;
     assert!(fields.iter().any(|field| field == "extra"));
-    let rows =
-        support::fetch_table_rows(&http_client, &bq_http, &project_id, &dataset, &dest_table)
-            .await?;
-    let mapped = support::map_rows(&fields, rows)?;
+    let rows = emulator_read_support::fetch_table_rows(
+        &http_client,
+        &bq_http,
+        &project_id,
+        &dataset,
+        &dest_table,
+    )
+    .await?;
+    let mapped = emulator_read_support::map_rows(&fields, rows)?;
     assert_eq!(mapped.len(), 2);
     let extra_value = mapped
         .iter()
-        .find(|row| support::value_to_string(row.get("id").unwrap()) == Some("2".to_string()))
+        .find(|row| {
+            emulator_read_support::value_to_string(row.get("id").unwrap()) == Some("2".to_string())
+        })
         .and_then(|row| row.get("extra"))
-        .and_then(support::value_to_string);
+        .and_then(emulator_read_support::value_to_string);
     assert_eq!(extra_value, Some("extra".to_string()));
     Ok(())
 }
@@ -168,6 +192,7 @@ async fn e2e_schema_addition_auto_alters_destination() -> Result<()> {
 #[tokio::test]
 #[ignore]
 async fn e2e_schema_change_fail_fast() -> Result<()> {
+    dotenv_support::load_dotenv()?;
     let pg_url = env::var("CDSYNC_E2E_PG_URL")
         .context("set CDSYNC_E2E_PG_URL to a Postgres connection string")?;
     let bq_http = env::var("CDSYNC_E2E_BQ_HTTP")
@@ -298,6 +323,7 @@ async fn e2e_schema_change_fail_fast() -> Result<()> {
 #[tokio::test]
 #[ignore]
 async fn e2e_schema_removal_resyncs_table() -> Result<()> {
+    dotenv_support::load_dotenv()?;
     let pg_url = env::var("CDSYNC_E2E_PG_URL")
         .context("set CDSYNC_E2E_PG_URL to a Postgres connection string")?;
     let bq_http = env::var("CDSYNC_E2E_BQ_HTTP")
@@ -313,8 +339,14 @@ async fn e2e_schema_removal_resyncs_table() -> Result<()> {
     let dest_table = destination_table_name(&qualified_table);
 
     let http_client = reqwest::Client::new();
-    support::delete_table_if_exists(&http_client, &bq_http, &project_id, &dataset, &dest_table)
-        .await?;
+    emulator_delete_support::delete_table_if_exists(
+        &http_client,
+        &bq_http,
+        &project_id,
+        &dataset,
+        &dest_table,
+    )
+    .await?;
 
     let pool = PgPoolOptions::new()
         .max_connections(1)
@@ -433,19 +465,29 @@ async fn e2e_schema_removal_resyncs_table() -> Result<()> {
         .await?;
     state.postgres.insert(qualified_table.clone(), checkpoint);
 
-    let fields =
-        support::fetch_table_fields(&http_client, &bq_http, &project_id, &dataset, &dest_table)
-            .await?;
-    let rows =
-        support::fetch_table_rows(&http_client, &bq_http, &project_id, &dataset, &dest_table)
-            .await?;
-    let mapped = support::map_rows(&fields, rows)?;
+    let fields = emulator_read_support::fetch_table_fields(
+        &http_client,
+        &bq_http,
+        &project_id,
+        &dataset,
+        &dest_table,
+    )
+    .await?;
+    let rows = emulator_read_support::fetch_table_rows(
+        &http_client,
+        &bq_http,
+        &project_id,
+        &dataset,
+        &dest_table,
+    )
+    .await?;
+    let mapped = emulator_read_support::map_rows(&fields, rows)?;
 
     assert_eq!(mapped.len(), 2);
     let mut ids: Vec<String> = mapped
         .iter()
         .filter_map(|row| row.get("id"))
-        .filter_map(support::value_to_string)
+        .filter_map(emulator_read_support::value_to_string)
         .collect();
     ids.sort();
     assert_eq!(ids, vec!["1".to_string(), "2".to_string()]);

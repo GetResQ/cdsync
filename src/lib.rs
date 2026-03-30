@@ -1,5 +1,6 @@
 pub mod config;
 pub mod destinations;
+pub mod dotenv;
 pub mod runner;
 pub mod sources;
 pub mod state;

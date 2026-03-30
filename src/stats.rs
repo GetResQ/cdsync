@@ -127,6 +127,11 @@ impl StatsHandle {
         guard.error = error;
     }
 
+    pub async fn run_id(&self) -> String {
+        let guard = self.inner.lock().await;
+        guard.run_id.clone()
+    }
+
     pub async fn record_extract(&self, table: &str, rows: usize, elapsed_ms: u64) {
         let mut guard = self.inner.lock().await;
         let rows = rows as i64;

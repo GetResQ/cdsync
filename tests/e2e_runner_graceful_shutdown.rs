@@ -9,10 +9,13 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 use uuid::Uuid;
+#[path = "support/dotenv.rs"]
+mod dotenv_support;
 
 #[tokio::test]
 #[ignore]
 async fn e2e_runner_polling_graceful_shutdown() -> Result<()> {
+    dotenv_support::load_dotenv()?;
     let pg_url = env::var("CDSYNC_E2E_PG_URL")
         .context("set CDSYNC_E2E_PG_URL to a Postgres connection string")?;
     let bq_http = env::var("CDSYNC_E2E_BQ_HTTP")
@@ -118,6 +121,7 @@ connections:
 #[tokio::test]
 #[ignore]
 async fn e2e_runner_cdc_graceful_shutdown() -> Result<()> {
+    dotenv_support::load_dotenv()?;
     let pg_url = env::var("CDSYNC_E2E_PG_URL")
         .context("set CDSYNC_E2E_PG_URL to a Postgres connection string")?;
     let bq_http = env::var("CDSYNC_E2E_BQ_HTTP")

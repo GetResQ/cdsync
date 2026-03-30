@@ -55,6 +55,7 @@ struct ReplicationMetrics {
     rows_written_total: Counter<u64>,
     checkpoint_saves_total: Counter<u64>,
     bigquery_row_errors_total: Counter<u64>,
+    retry_attempts_total: Counter<u64>,
     reconcile_tables_total: Counter<u64>,
     reconcile_mismatches_total: Counter<u64>,
     sync_runs_total: Counter<u64>,
@@ -153,6 +154,17 @@ pub fn record_bigquery_row_errors(table: &str, rows: u64) {
         .add(rows, &[KeyValue::new("table", table.to_string())]);
 }
 
+pub fn record_retry_attempt(connection_id: &str, scope: &str) {
+    let metrics = metrics();
+    metrics.retry_attempts_total.add(
+        1,
+        &[
+            KeyValue::new("connection_id", connection_id.to_string()),
+            KeyValue::new("scope", scope.to_string()),
+        ],
+    );
+}
+
 pub fn record_reconcile_table(connection_id: &str, matched: bool) {
     let metrics = metrics();
     let attrs = [
@@ -187,6 +199,7 @@ fn metrics() -> &'static ReplicationMetrics {
             bigquery_row_errors_total: meter
                 .u64_counter("cdsync_bigquery_row_errors_total")
                 .build(),
+            retry_attempts_total: meter.u64_counter("cdsync_retry_attempts_total").build(),
             reconcile_tables_total: meter.u64_counter("cdsync_reconcile_tables_total").build(),
             reconcile_mismatches_total: meter
                 .u64_counter("cdsync_reconcile_mismatches_total")

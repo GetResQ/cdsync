@@ -647,6 +647,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "dotenvy",
  "etl",
  "etl-postgres",
  "futures",

@@ -8,9 +8,11 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tracing::warn;
 use uuid::Uuid;
 
 const LOCK_TTL_SECONDS: u64 = 60;
@@ -55,11 +57,15 @@ pub struct StateHandle {
 }
 
 pub struct ConnectionLease {
+    cleanup: Option<Arc<LeaseCleanup>>,
+    stop_tx: Option<oneshot::Sender<()>>,
+    heartbeat_task: Option<JoinHandle<()>>,
+}
+
+struct LeaseCleanup {
     store: SyncStateStore,
     connection_id: String,
     owner_id: String,
-    stop_tx: Option<oneshot::Sender<()>>,
-    heartbeat_task: Option<JoinHandle<()>>,
 }
 
 impl SyncState {
@@ -303,6 +309,37 @@ impl SyncStateStore {
         Ok(())
     }
 
+    pub async fn load_table_checkpoint(
+        &self,
+        connection_id: &str,
+        source_kind: &str,
+        entity_name: &str,
+    ) -> anyhow::Result<Option<TableCheckpoint>> {
+        let row = sqlx::query(
+            r#"
+            select checkpoint_json
+            from table_checkpoints
+            where connection_id = ? and source_kind = ? and entity_name = ?
+            "#,
+        )
+        .bind(connection_id)
+        .bind(source_kind)
+        .bind(entity_name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(|row| {
+            let checkpoint_json: String = row.try_get("checkpoint_json")?;
+            serde_json::from_str(&checkpoint_json).with_context(|| {
+                format!(
+                    "parsing checkpoint for {}:{}:{}",
+                    connection_id, source_kind, entity_name
+                )
+            })
+        })
+        .transpose()
+    }
+
     pub async fn acquire_connection_lock(
         &self,
         connection_id: &str,
@@ -328,9 +365,11 @@ impl SyncStateStore {
         });
 
         Ok(ConnectionLease {
-            store: self.clone(),
-            connection_id: connection_id.to_string(),
-            owner_id,
+            cleanup: Some(Arc::new(LeaseCleanup {
+                store: self.clone(),
+                connection_id: connection_id.to_string(),
+                owner_id,
+            })),
             stop_tx: Some(stop_tx),
             heartbeat_task: Some(heartbeat_task),
         })
@@ -530,19 +569,77 @@ impl StateHandle {
             .save_postgres_cdc_state(&self.connection_id, cdc_state)
             .await
     }
+
+    pub async fn load_postgres_checkpoint(
+        &self,
+        table_name: &str,
+    ) -> anyhow::Result<Option<TableCheckpoint>> {
+        self.store
+            .load_table_checkpoint(&self.connection_id, "postgres", table_name)
+            .await
+    }
+
+    pub async fn load_salesforce_checkpoint(
+        &self,
+        object_name: &str,
+    ) -> anyhow::Result<Option<TableCheckpoint>> {
+        self.store
+            .load_table_checkpoint(&self.connection_id, "salesforce", object_name)
+            .await
+    }
 }
 
 impl ConnectionLease {
     pub async fn release(mut self) -> anyhow::Result<()> {
-        if let Some(stop_tx) = self.stop_tx.take() {
+        let cleanup = self
+            .cleanup
+            .take()
+            .context("connection lease already released")?;
+        Self::cleanup_parts(cleanup, self.stop_tx.take(), self.heartbeat_task.take()).await
+    }
+
+    async fn cleanup_parts(
+        cleanup: Arc<LeaseCleanup>,
+        stop_tx: Option<oneshot::Sender<()>>,
+        heartbeat_task: Option<JoinHandle<()>>,
+    ) -> anyhow::Result<()> {
+        if let Some(stop_tx) = stop_tx {
             let _ = stop_tx.send(());
         }
-        if let Some(task) = self.heartbeat_task.take() {
+        if let Some(task) = heartbeat_task {
             let _ = task.await;
         }
-        self.store
-            .release_lock(&self.connection_id, &self.owner_id)
+        cleanup
+            .store
+            .release_lock(&cleanup.connection_id, &cleanup.owner_id)
             .await
+    }
+}
+
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        let Some(cleanup) = self.cleanup.take() else {
+            return;
+        };
+
+        let stop_tx = self.stop_tx.take();
+        let heartbeat_task = self.heartbeat_task.take();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if let Err(error) =
+                        ConnectionLease::cleanup_parts(cleanup, stop_tx, heartbeat_task).await
+                    {
+                        warn!(error = %error, "failed to clean up connection lease on drop");
+                    }
+                });
+            }
+            Err(_) => {
+                warn!(
+                    "dropping connection lease without an active tokio runtime; lock cleanup skipped"
+                );
+            }
+        }
     }
 }
 
@@ -644,6 +741,33 @@ mod tests {
         let second = store.acquire_connection_lock("app").await;
         assert!(second.is_err());
         lease.release().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropping_connection_lease_releases_lock() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("state.db");
+        let store = SyncStateStore::open(&path).await?;
+
+        {
+            let _lease = store.acquire_connection_lock("app").await?;
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match store.acquire_connection_lock("app").await {
+                    Ok(lease) => {
+                        lease.release().await?;
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .context("lock was not released after dropping lease")??;
+
         Ok(())
     }
 }

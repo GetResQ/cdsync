@@ -4,20 +4,24 @@ use cdsync::destinations::bigquery::BigQueryDestination;
 use cdsync::sources::postgres::{PostgresSource, TableSyncRequest};
 use cdsync::state::ConnectionState;
 use cdsync::types::{MetadataColumns, SyncMode, destination_table_name};
-mod support;
 use sqlx::postgres::PgPoolOptions;
 use std::env;
 use std::path::PathBuf;
 use uuid::Uuid;
+#[path = "support/dotenv.rs"]
+mod dotenv_support;
+#[path = "support/real_bigquery.rs"]
+mod real_bigquery_support;
 
 #[tokio::test]
 #[ignore]
 async fn e2e_postgres_bigquery_real_heavy_sync() -> Result<()> {
-    support::real_bigquery::install_rustls_provider();
+    dotenv_support::load_dotenv()?;
+    real_bigquery_support::install_rustls_provider();
 
     let pg_url = env::var("CDSYNC_E2E_PG_URL")
         .unwrap_or_else(|_| "postgres://cdsync:cdsync@localhost:5433/cdsync".to_string());
-    let real_bq = support::real_bigquery::load_env()?;
+    let real_bq = real_bigquery_support::load_env()?;
 
     let suffix = Uuid::new_v4().simple().to_string();
     let table_name = format!("cdsync_real_{}", &suffix[..8]);
@@ -196,8 +200,8 @@ async fn e2e_postgres_bigquery_real_heavy_sync() -> Result<()> {
     assert_eq!(final_dest.row_count, 1120);
     assert_eq!(final_dest.deleted_rows, 150);
 
-    let client = support::real_bigquery::client(&real_bq.key_path).await?;
-    let schema_fields = support::real_bigquery::fetch_live_table_fields(
+    let client = real_bigquery_support::client(&real_bq.key_path).await?;
+    let schema_fields = real_bigquery_support::fetch_live_table_fields(
         &client,
         &real_bq.project_id,
         &real_bq.dataset,
@@ -216,7 +220,7 @@ async fn e2e_postgres_bigquery_real_heavy_sync() -> Result<()> {
             .any(|field| field == "_cdsync_deleted_at")
     );
 
-    let extra_count = support::real_bigquery::query_i64(
+    let extra_count = real_bigquery_support::query_i64(
         &client,
         &real_bq.project_id,
         &real_bq.location,
@@ -230,7 +234,7 @@ async fn e2e_postgres_bigquery_real_heavy_sync() -> Result<()> {
     .await?;
     assert_eq!(extra_count, 150);
 
-    let deleted_count = support::real_bigquery::query_i64(
+    let deleted_count = real_bigquery_support::query_i64(
         &client,
         &real_bq.project_id,
         &real_bq.location,

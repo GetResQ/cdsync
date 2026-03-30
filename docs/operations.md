@@ -4,6 +4,18 @@
 
 Use `run` when you want CDSync to stay alive under a process manager instead of invoking one-shot `sync`.
 
+## Metadata Columns
+
+Destination metadata columns are configurable at the top level:
+
+```yaml
+metadata:
+  synced_at_column: "_cdsync_synced_at"
+  deleted_at_column: "_cdsync_deleted_at"
+```
+
+Defaults remain unchanged if omitted.
+
 ### PostgreSQL CDC
 
 For PostgreSQL connections with `cdc: true`, `run` uses long-lived CDC follow mode and exits cleanly on `SIGINT` or `SIGTERM`.
@@ -56,6 +68,19 @@ docker run --rm \
   -v $(pwd)/state:/var/lib/cdsync \
   cdsync-runner --config /etc/cdsync/config.yaml --connection app
 ```
+
+## Real BigQuery
+
+For live BigQuery validation, set:
+
+```bash
+export CDSYNC_REAL_BQ_PROJECT="nora-461013"
+export CDSYNC_REAL_BQ_DATASET="cdsync_e2e_real"
+export CDSYNC_REAL_BQ_LOCATION="US"
+export CDSYNC_REAL_BQ_KEY_PATH="/absolute/path/to/service-account.json"
+```
+
+Then run the ignored live tests from [e2e.md](/Users/mazdak/Code/cdsync/docs/e2e.md).
 
 ## Graceful Shutdown
 

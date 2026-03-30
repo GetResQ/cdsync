@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::Code;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use url::Url;
 
 #[derive(Clone)]
@@ -270,6 +270,7 @@ impl BigQueryDestination {
         if let Some(errors) = &response.errors
             && !errors.is_empty()
         {
+            error!(errors = ?errors, "BigQuery query returned errors");
             anyhow::bail!("BigQuery query returned errors: {:?}", errors);
         }
 
@@ -320,13 +321,26 @@ impl BigQueryDestination {
                 return Ok(true);
             }
             Err(err) => {
+                error!(
+                    table = %table_id,
+                    rows = batch_len,
+                    error = %err,
+                    "BigQuery Storage Write append failed"
+                );
                 return Err(anyhow::anyhow!("storage write append failed: {}", err));
             }
         };
 
         while let Some(response) = responses.next().await {
-            let response = response
-                .map_err(|err| anyhow::anyhow!("storage write response failed: {}", err))?;
+            let response = response.map_err(|err| {
+                error!(
+                    table = %table_id,
+                    rows = batch_len,
+                    error = %err,
+                    "BigQuery Storage Write response failed"
+                );
+                anyhow::anyhow!("storage write response failed: {}", err)
+            })?;
             if let Some(advance_offset) = validate_storage_write_response(table_id, &response)?
                 && advance_offset
             {
@@ -539,12 +553,24 @@ impl BigQueryDestination {
                 .send()
                 .await?;
             if !response.status().is_success() {
+                error!(
+                    table = %table_id,
+                    status = %response.status(),
+                    rows = frame.height(),
+                    "BigQuery emulator insert request failed"
+                );
                 anyhow::bail!("emulator insert failed: {}", response.status());
             }
             let payload: serde_json::Value = response.json().await?;
             if let Some(errors) = payload.get("insertErrors") {
                 let row_errors = errors.as_array().map(|rows| rows.len()).unwrap_or(1) as u64;
                 crate::telemetry::record_bigquery_row_errors(table_id, row_errors);
+                error!(
+                    table = %table_id,
+                    row_errors,
+                    rows = frame.height(),
+                    "BigQuery emulator insert returned row errors"
+                );
                 anyhow::bail!(
                     "BigQuery emulator insert errors for {}: {}",
                     table_id,
@@ -566,6 +592,12 @@ impl BigQueryDestination {
             .await?;
         if let Some(errors) = response.insert_errors {
             crate::telemetry::record_bigquery_row_errors(table_id, errors.len() as u64);
+            error!(
+                table = %table_id,
+                row_errors = errors.len(),
+                rows = frame.height(),
+                "BigQuery insertAll returned row errors"
+            );
             anyhow::bail!(
                 "BigQuery insert errors for {}: {} rows",
                 table_id,
@@ -613,29 +645,9 @@ impl BigQueryDestination {
             insert_vals = insert_vals.join(", ")
         );
 
-        let request = QueryRequest {
-            query: sql,
-            use_legacy_sql: false,
-            location: self.config.location.clone().unwrap_or_default(),
-            ..Default::default()
-        };
-
-        if let Some(emulator_http) = &self.config.emulator_http {
-            let client = reqwest::Client::new();
-            let url = format!(
-                "{}/projects/{}/queries",
-                emulator_http, self.config.project_id
-            );
-            let response = client.post(url).json(&request).send().await?;
-            if response.status().is_success() {
-                return Ok(());
-            }
-            anyhow::bail!("emulator query failed: {}", response.status());
-        }
-        self.client
-            .job()
-            .query(&self.config.project_id, &request)
-            .await?;
+        self.run_query(&sql).await.with_context(|| {
+            format!("merging staging BigQuery table {} into {}", staging, target)
+        })?;
         Ok(())
     }
 }
@@ -662,6 +674,11 @@ impl Destination for BigQueryDestination {
             if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
                 return Ok(());
             }
+            error!(
+                table = %table,
+                status = %response.status(),
+                "BigQuery emulator delete table failed"
+            );
             anyhow::bail!("emulator delete table failed: {}", response.status());
         }
         let sql = format!(
@@ -670,16 +687,9 @@ impl Destination for BigQueryDestination {
             dataset = self.config.dataset,
             table = table
         );
-        let request = QueryRequest {
-            query: sql,
-            use_legacy_sql: false,
-            location: self.config.location.clone().unwrap_or_default(),
-            ..Default::default()
-        };
-        self.client
-            .job()
-            .query(&self.config.project_id, &request)
-            .await?;
+        self.run_query(&sql)
+            .await
+            .with_context(|| format!("truncating BigQuery table {}", table))?;
         Ok(())
     }
 

@@ -34,6 +34,7 @@ If you already run Postgres elsewhere, point `CDSYNC_E2E_PG_URL` at that instanc
 
 ```
 cargo test --test e2e_postgres_bigquery -- --ignored --nocapture
+cargo test --test e2e_postgres_bigquery -- --ignored e2e_postgres_bigquery_custom_metadata_columns --nocapture
 ```
 
 ## CDC test
@@ -57,6 +58,44 @@ cargo test --test e2e_runner_graceful_shutdown -- --ignored --nocapture
 - The BigQuery emulator does not support MERGE, so upserts append rows. Tests that validate soft deletes
   check for at least one row with `_cdsync_deleted_at` set rather than assuming a single-row table.
 - The emulator deletes tables on truncate; CDSync recreates tables during full refresh to avoid 404s.
+- Metadata columns are configurable. The emulator suite includes a custom-column test.
+
+## Real BigQuery tests
+
+Use these when you want to validate the real BigQuery path, including Storage Write and MERGE behavior.
+
+### Environment variables
+
+```
+export CDSYNC_REAL_BQ_PROJECT="nora-461013"
+export CDSYNC_REAL_BQ_DATASET="cdsync_e2e_real"
+export CDSYNC_REAL_BQ_LOCATION="US"
+export CDSYNC_REAL_BQ_KEY_PATH="/absolute/path/to/service-account.json"
+export CDSYNC_E2E_PG_URL="postgres://cdsync:cdsync@localhost:5433/cdsync"
+```
+
+### Heavy live sync tests
+
+Polling / incremental path:
+
+```
+cargo test --test e2e_postgres_bigquery_real -- --ignored --nocapture
+```
+
+CDC path:
+
+```
+cargo test --test e2e_postgres_bigquery_real_cdc -- --ignored --nocapture
+```
+
+These tests cover:
+
+- 1000-row initial load
+- hundreds of updates
+- inserts
+- soft deletes / CDC deletes
+- schema addition
+- validation against real BigQuery row counts, deleted markers, and schema fields
 
 ## Quick cloud smoke test (AWS RDS Postgres + BigQuery)
 
@@ -105,6 +144,10 @@ CREATE PUBLICATION cdsync_pub
 ### 3) Example config (YAML)
 
 ```
+metadata:
+  synced_at_column: _cdsync_synced_at
+  deleted_at_column: _cdsync_deleted_at
+
 connections:
   - id: rds_to_bq
     enabled: true
@@ -133,6 +176,7 @@ connections:
       dataset: cdsync_test
       location: US
       service_account_key_path: /path/to/bq-sa.json
+      storage_write_enabled: true
 
 state:
   path: ./state.db
@@ -151,3 +195,4 @@ cdsync report --connection rds_to_bq --limit 10
 Notes:
 - CDC must connect to the writer. If you only have a read replica, set `cdc: false` and rely on polling via `updated_at_column`.
 - For row-filtered CDC, the publication `WHERE (...)` and the config `where_clause` must match exactly (validate will show diffs).
+- `metadata.synced_at_column` and `metadata.deleted_at_column` are configurable, but both default to `_cdsync_synced_at` and `_cdsync_deleted_at`.

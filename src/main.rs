@@ -1,5 +1,6 @@
 mod config;
 mod destinations;
+mod dotenv;
 mod runner;
 mod sources;
 mod state;
@@ -14,7 +15,7 @@ use crate::sources::postgres::{CdcSyncRequest, PostgresSource, TableSyncRequest}
 use crate::sources::salesforce::{SalesforceSource, SalesforceSyncRequest};
 use crate::state::{ConnectionState, SyncState, SyncStateStore};
 use crate::stats::{StatsDb, StatsHandle};
-use crate::types::SyncMode;
+use crate::types::{SyncMode, TableCheckpoint};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
@@ -24,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(name = "cdsync", version, about = "CDSync - Open-source data sync")]
@@ -106,6 +107,7 @@ struct SyncConnectionRequest<'a> {
     max_concurrency: usize,
     retry_backoff_ms: u64,
     schema_diff_enabled: bool,
+    run_id: Option<String>,
     stats: Option<StatsHandle>,
     shutdown: Option<ShutdownSignal>,
 }
@@ -146,6 +148,27 @@ struct TableReconciliationReport {
     error: Option<String>,
 }
 
+fn select_sync_connections<'a>(
+    connections: &'a [crate::config::ConnectionConfig],
+    filter: Option<&str>,
+) -> Result<Vec<&'a crate::config::ConnectionConfig>> {
+    if let Some(filter) = filter {
+        let connection = connections
+            .iter()
+            .find(|connection| connection.id == filter)
+            .context("connection not found")?;
+        if !connection.enabled() {
+            anyhow::bail!("connection {} is disabled", connection.id);
+        }
+        return Ok(vec![connection]);
+    }
+
+    Ok(connections
+        .iter()
+        .filter(|connection| connection.enabled())
+        .collect())
+}
+
 fn reconcile_count_match(
     source_summary: &crate::sources::postgres::PostgresTableSummary,
     destination_summary: &crate::destinations::bigquery::DestinationTableSummary,
@@ -161,8 +184,47 @@ fn reconcile_count_match(
     source_summary.row_count == live_destination_rows
 }
 
+async fn load_latest_postgres_checkpoint(
+    state_handle: &crate::state::StateHandle,
+    table_name: &str,
+    fallback: &TableCheckpoint,
+) -> TableCheckpoint {
+    match state_handle.load_postgres_checkpoint(table_name).await {
+        Ok(Some(checkpoint)) => checkpoint,
+        Ok(None) => fallback.clone(),
+        Err(err) => {
+            warn!(
+                table = %table_name,
+                error = %err,
+                "failed to load persisted postgres checkpoint after interrupted retry; using in-memory checkpoint"
+            );
+            fallback.clone()
+        }
+    }
+}
+
+async fn load_latest_salesforce_checkpoint(
+    state_handle: &crate::state::StateHandle,
+    object_name: &str,
+    fallback: &TableCheckpoint,
+) -> TableCheckpoint {
+    match state_handle.load_salesforce_checkpoint(object_name).await {
+        Ok(Some(checkpoint)) => checkpoint,
+        Ok(None) => fallback.clone(),
+        Err(err) => {
+            warn!(
+                object = %object_name,
+                error = %err,
+                "failed to load persisted salesforce checkpoint after interrupted retry; using in-memory checkpoint"
+            );
+            fallback.clone()
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenv::load_dotenv()?;
     let cli = Cli::parse();
     match cli.command {
         Commands::Init { config } => cmd_init(config).await,
@@ -306,17 +368,10 @@ async fn cmd_sync(request: SyncCommandRequest) -> Result<()> {
         .as_ref()
         .and_then(|s| s.retry_backoff_ms)
         .unwrap_or(1000);
+    let selected_connections =
+        select_sync_connections(&cfg.connections, connection_filter.as_deref())?;
 
-    for connection in &cfg.connections {
-        if !connection.enabled() {
-            continue;
-        }
-        if let Some(filter) = &connection_filter
-            && &connection.id != filter
-        {
-            continue;
-        }
-
+    for connection in selected_connections {
         let connection_state = state
             .connections
             .entry(connection.id.clone())
@@ -329,6 +384,18 @@ async fn cmd_sync(request: SyncCommandRequest) -> Result<()> {
         state_handle.save_connection_meta(connection_state).await?;
 
         let stats_handle = stats_db.as_ref().map(|_| StatsHandle::new(&connection.id));
+        let run_id = match &stats_handle {
+            Some(handle) => Some(handle.run_id().await),
+            None => None,
+        };
+        info!(
+            connection = %connection.id,
+            run_id = run_id.as_deref().unwrap_or("none"),
+            mode = ?mode,
+            dry_run,
+            follow,
+            "starting connection sync"
+        );
 
         let result = sync_connection(SyncConnectionRequest {
             connection,
@@ -343,6 +410,7 @@ async fn cmd_sync(request: SyncCommandRequest) -> Result<()> {
             max_concurrency,
             retry_backoff_ms,
             schema_diff_enabled,
+            run_id: run_id.clone(),
             stats: stats_handle.clone(),
             shutdown: shutdown.clone(),
         })
@@ -353,10 +421,21 @@ async fn cmd_sync(request: SyncCommandRequest) -> Result<()> {
         match &result {
             Ok(_) => {
                 connection_state.last_sync_status = Some("success".to_string());
+                info!(
+                    connection = %connection.id,
+                    run_id = run_id.as_deref().unwrap_or("none"),
+                    "connection sync completed successfully"
+                );
             }
-            Err(_) => {
+            Err(err) => {
                 connection_state.last_sync_status = Some("failed".to_string());
                 connection_state.last_error = error_string.clone();
+                error!(
+                    connection = %connection.id,
+                    run_id = run_id.as_deref().unwrap_or("none"),
+                    error = %err,
+                    "connection sync failed"
+                );
             }
         }
         if let Some(handle) = &stats_handle {
@@ -403,6 +482,7 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
         max_concurrency,
         retry_backoff_ms,
         schema_diff_enabled,
+        run_id,
         stats,
         shutdown,
     } = request;
@@ -421,7 +501,11 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
                 anyhow::bail!("--follow requires postgres.cdc=true");
             }
             if source.cdc_enabled() {
-                info!("syncing postgres via CDC");
+                info!(
+                    connection = %connection.id,
+                    run_id = run_id.as_deref().unwrap_or("none"),
+                    "syncing postgres via CDC"
+                );
                 let mut attempt = 0;
                 let mut backoff = Duration::from_millis(retry_backoff_ms);
                 loop {
@@ -444,14 +528,38 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
                         .with_context(|| "syncing postgres CDC");
                     match result {
                         Ok(_) => break,
-                        Err(_err) if follow || attempt < max_retries => {
+                        Err(err) if follow || attempt < max_retries => {
+                            telemetry::record_retry_attempt(&connection.id, "postgres_cdc");
+                            warn!(
+                                connection = %connection.id,
+                                run_id = run_id.as_deref().unwrap_or("none"),
+                                attempt,
+                                backoff_ms = backoff.as_millis() as u64,
+                                error = %err,
+                                "postgres CDC sync attempt failed; retrying"
+                            );
                             if wait_backoff(backoff, shutdown.clone()).await {
+                                info!(
+                                    connection = %connection.id,
+                                    run_id = run_id.as_deref().unwrap_or("none"),
+                                    attempt,
+                                    "shutdown requested during postgres CDC retry backoff"
+                                );
                                 return Ok(());
                             }
                             backoff = Duration::from_millis(backoff.as_millis() as u64 * 2);
                             continue;
                         }
-                        Err(err) => return Err(err),
+                        Err(err) => {
+                            error!(
+                                connection = %connection.id,
+                                run_id = run_id.as_deref().unwrap_or("none"),
+                                attempt,
+                                error = %err,
+                                "postgres CDC sync attempt failed permanently"
+                            );
+                            return Err(err);
+                        }
                     }
                 }
             } else {
@@ -475,6 +583,8 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
                     let stats = stats.clone();
                     let state_handle = state_handle.clone();
                     let shutdown = shutdown.clone();
+                    let run_id = run_id.clone();
+                    let connection_id = connection.id.clone();
                     let semaphore = Arc::clone(&semaphore);
                     tasks.push(async move {
                         let permit = match semaphore.acquire_owned().await {
@@ -506,15 +616,53 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
                                 .await
                                 .with_context(|| format!("syncing postgres table {}", table.name));
                             match attempt_result {
-                                Ok(checkpoint) => break Ok(checkpoint),
-                                Err(_err) if attempt < max_retries => {
+                                Ok(next_checkpoint) => break Ok(next_checkpoint),
+                                Err(err) if attempt < max_retries => {
+                                    telemetry::record_retry_attempt(&connection_id, "postgres_table");
+                                    warn!(
+                                        connection = %connection_id,
+                                        run_id = run_id.as_deref().unwrap_or("none"),
+                                        table = %table.name,
+                                        attempt,
+                                        backoff_ms = backoff.as_millis() as u64,
+                                        last_synced_at = ?checkpoint.last_synced_at,
+                                        last_primary_key = checkpoint.last_primary_key.as_deref().unwrap_or("none"),
+                                        error = %err,
+                                        "postgres table sync attempt failed; retrying"
+                                    );
                                     if wait_backoff(backoff, shutdown.clone()).await {
-                                        break Ok(checkpoint.clone());
+                                        info!(
+                                            connection = %connection_id,
+                                            run_id = run_id.as_deref().unwrap_or("none"),
+                                            table = %table.name,
+                                            attempt,
+                                            "shutdown requested during postgres table retry backoff"
+                                        );
+                                        break Ok(
+                                            load_latest_postgres_checkpoint(
+                                                &state_handle,
+                                                &table.name,
+                                                &checkpoint,
+                                            )
+                                            .await,
+                                        );
                                     }
                                     backoff = Duration::from_millis(backoff.as_millis() as u64 * 2);
                                     continue;
                                 }
-                                Err(err) => break Err(err),
+                                Err(err) => {
+                                    error!(
+                                        connection = %connection_id,
+                                        run_id = run_id.as_deref().unwrap_or("none"),
+                                        table = %table.name,
+                                        attempt,
+                                        last_synced_at = ?checkpoint.last_synced_at,
+                                        last_primary_key = checkpoint.last_primary_key.as_deref().unwrap_or("none"),
+                                        error = %err,
+                                        "postgres table sync attempt failed permanently"
+                                    );
+                                    break Err(err);
+                                }
                             }
                         };
                         (table.name.clone(), result)
@@ -563,6 +711,8 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
                 let stats = stats.clone();
                 let state_handle = state_handle.clone();
                 let shutdown = shutdown.clone();
+                let run_id = run_id.clone();
+                let connection_id = connection.id.clone();
                 let semaphore = Arc::clone(&semaphore);
                 tasks.push(async move {
                     let permit = match semaphore.acquire_owned().await {
@@ -592,15 +742,53 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
                             .await
                             .with_context(|| format!("syncing salesforce object {}", object.name));
                         match attempt_result {
-                            Ok(checkpoint) => break Ok(checkpoint),
-                            Err(_err) if attempt < max_retries => {
+                            Ok(next_checkpoint) => break Ok(next_checkpoint),
+                            Err(err) if attempt < max_retries => {
+                                telemetry::record_retry_attempt(&connection_id, "salesforce_object");
+                                warn!(
+                                    connection = %connection_id,
+                                    run_id = run_id.as_deref().unwrap_or("none"),
+                                    object = %object.name,
+                                    attempt,
+                                    backoff_ms = backoff.as_millis() as u64,
+                                    last_synced_at = ?checkpoint.last_synced_at,
+                                    last_primary_key = checkpoint.last_primary_key.as_deref().unwrap_or("none"),
+                                    error = %err,
+                                    "salesforce object sync attempt failed; retrying"
+                                );
                                 if wait_backoff(backoff, shutdown.clone()).await {
-                                    break Ok(checkpoint.clone());
+                                    info!(
+                                        connection = %connection_id,
+                                        run_id = run_id.as_deref().unwrap_or("none"),
+                                        object = %object.name,
+                                        attempt,
+                                        "shutdown requested during salesforce retry backoff"
+                                    );
+                                    break Ok(
+                                        load_latest_salesforce_checkpoint(
+                                            &state_handle,
+                                            &object.name,
+                                            &checkpoint,
+                                        )
+                                        .await,
+                                    );
                                 }
                                 backoff = Duration::from_millis(backoff.as_millis() as u64 * 2);
                                 continue;
                             }
-                            Err(err) => break Err(err),
+                            Err(err) => {
+                                error!(
+                                    connection = %connection_id,
+                                    run_id = run_id.as_deref().unwrap_or("none"),
+                                    object = %object.name,
+                                    attempt,
+                                    last_synced_at = ?checkpoint.last_synced_at,
+                                    last_primary_key = checkpoint.last_primary_key.as_deref().unwrap_or("none"),
+                                    error = %err,
+                                    "salesforce object sync attempt failed permanently"
+                                );
+                                break Err(err);
+                            }
                         }
                     };
                     (object.name.clone(), result)
@@ -966,5 +1154,141 @@ mod reconcile_tests {
         };
 
         assert!(!reconcile_count_match(&source, &destination, &table));
+    }
+}
+
+#[cfg(test)]
+mod sync_selection_tests {
+    use super::*;
+
+    fn postgres_connection(id: &str, enabled: Option<bool>) -> crate::config::ConnectionConfig {
+        crate::config::ConnectionConfig {
+            id: id.to_string(),
+            enabled,
+            source: crate::config::SourceConfig::Postgres(crate::config::PostgresConfig {
+                url: "postgres://localhost/test".to_string(),
+                tables: Some(vec![crate::config::PostgresTableConfig {
+                    name: "public.accounts".to_string(),
+                    primary_key: Some("id".to_string()),
+                    updated_at_column: Some("updated_at".to_string()),
+                    soft_delete: Some(false),
+                    soft_delete_column: None,
+                    where_clause: None,
+                    columns: None,
+                }]),
+                table_selection: None,
+                batch_size: Some(1000),
+                cdc: Some(false),
+                publication: None,
+                schema_changes: Some(crate::config::SchemaChangePolicy::Auto),
+                cdc_pipeline_id: None,
+                cdc_batch_size: None,
+                cdc_max_fill_ms: None,
+                cdc_max_pending_events: None,
+                cdc_idle_timeout_seconds: None,
+                cdc_tls: None,
+                cdc_tls_ca_path: None,
+                cdc_tls_ca: None,
+            }),
+            destination: crate::config::DestinationConfig::BigQuery(
+                crate::config::BigQueryConfig {
+                    project_id: "project".to_string(),
+                    dataset: "dataset".to_string(),
+                    location: Some("US".to_string()),
+                    service_account_key_path: None,
+                    service_account_key: None,
+                    partition_by_synced_at: Some(false),
+                    storage_write_enabled: Some(false),
+                    emulator_http: Some("http://localhost:9050".to_string()),
+                    emulator_grpc: Some("localhost:9051".to_string()),
+                },
+            ),
+            schedule: None,
+        }
+    }
+
+    #[test]
+    fn select_sync_connections_errors_when_filter_missing() {
+        let connections = vec![postgres_connection("app", Some(true))];
+
+        let error = select_sync_connections(&connections, Some("missing"))
+            .expect_err("missing connection should fail");
+
+        assert!(error.to_string().contains("connection not found"));
+    }
+
+    #[test]
+    fn select_sync_connections_errors_when_filtered_connection_is_disabled() {
+        let connections = vec![postgres_connection("app", Some(false))];
+
+        let error = select_sync_connections(&connections, Some("app"))
+            .expect_err("disabled filtered connection should fail");
+
+        assert!(error.to_string().contains("disabled"));
+    }
+
+    #[test]
+    fn select_sync_connections_returns_only_enabled_connections_without_filter() {
+        let connections = vec![
+            postgres_connection("enabled", Some(true)),
+            postgres_connection("disabled", Some(false)),
+            postgres_connection("default_enabled", None),
+        ];
+
+        let selected = select_sync_connections(&connections, None).expect("selection succeeds");
+        let ids: Vec<&str> = selected
+            .iter()
+            .map(|connection| connection.id.as_str())
+            .collect();
+
+        assert_eq!(ids, vec!["enabled", "default_enabled"]);
+    }
+
+    #[tokio::test]
+    async fn load_latest_postgres_checkpoint_prefers_persisted_progress() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("state.db");
+        let store = SyncStateStore::open(&path).await?;
+        let handle = store.handle("app");
+        let persisted = TableCheckpoint {
+            last_primary_key: Some("42".to_string()),
+            ..Default::default()
+        };
+        handle
+            .save_postgres_checkpoint("public.accounts", &persisted)
+            .await?;
+
+        let fallback = TableCheckpoint {
+            last_primary_key: Some("1".to_string()),
+            ..Default::default()
+        };
+        let loaded = load_latest_postgres_checkpoint(&handle, "public.accounts", &fallback).await;
+
+        assert_eq!(loaded.last_primary_key.as_deref(), Some("42"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_latest_salesforce_checkpoint_prefers_persisted_progress() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("state.db");
+        let store = SyncStateStore::open(&path).await?;
+        let handle = store.handle("app");
+        let persisted = TableCheckpoint {
+            last_primary_key: Some("42".to_string()),
+            ..Default::default()
+        };
+        handle
+            .save_salesforce_checkpoint("Account", &persisted)
+            .await?;
+
+        let fallback = TableCheckpoint {
+            last_primary_key: Some("1".to_string()),
+            ..Default::default()
+        };
+        let loaded = load_latest_salesforce_checkpoint(&handle, "Account", &fallback).await;
+
+        assert_eq!(loaded.last_primary_key.as_deref(), Some("42"));
+        Ok(())
     }
 }
