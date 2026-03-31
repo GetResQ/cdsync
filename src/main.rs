@@ -2,6 +2,7 @@ mod admin_api;
 mod config;
 mod destinations;
 mod dotenv;
+mod ops;
 mod runner;
 mod sources;
 mod state;
@@ -9,20 +10,21 @@ mod stats;
 mod telemetry;
 mod tls;
 mod types;
+#[cfg(test)]
+mod main_tests;
 
 use crate::config::{Config, DestinationConfig, SourceConfig};
 use crate::destinations::bigquery::BigQueryDestination;
 use crate::runner::{ShutdownController, ShutdownSignal, schedule_interval};
 use crate::sources::postgres::{CdcSyncRequest, PostgresSource, TableSyncRequest};
 use crate::sources::salesforce::{SalesforceSource, SalesforceSyncRequest};
-use crate::state::{ConnectionState, SyncState, SyncStateStore};
+use crate::state::{ConnectionState, SyncStateStore};
 use crate::stats::{StatsDb, StatsHandle};
 use crate::types::{SyncMode, TableCheckpoint};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use futures::stream::{FuturesUnordered, StreamExt};
-use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -132,31 +134,6 @@ struct SyncCommandRequest {
     shutdown: Option<ShutdownSignal>,
 }
 
-#[derive(Serialize)]
-struct ReportOutput {
-    state: serde_json::Value,
-    recent_runs: Vec<crate::stats::RunSummary>,
-}
-
-#[derive(Serialize)]
-struct ReconciliationOutput {
-    connection_id: String,
-    tables: Vec<TableReconciliationReport>,
-}
-
-#[derive(Serialize)]
-struct TableReconciliationReport {
-    source_table: String,
-    destination_table: String,
-    source_row_count: Option<i64>,
-    destination_row_count: Option<i64>,
-    deleted_rows: Option<i64>,
-    source_max_updated_at: Option<chrono::DateTime<chrono::Utc>>,
-    destination_max_synced_at: Option<chrono::DateTime<chrono::Utc>>,
-    count_match: Option<bool>,
-    error: Option<String>,
-}
-
 struct StatsFlushHandle {
     stop_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
@@ -215,21 +192,6 @@ async fn stop_stats_flush_task(flush: Option<StatsFlushHandle>) {
     if let Err(err) = flush.task.await {
         warn!(error = %err, "stats flush task join failed");
     }
-}
-
-fn reconcile_count_match(
-    source_summary: &crate::sources::postgres::PostgresTableSummary,
-    destination_summary: &crate::destinations::bigquery::DestinationTableSummary,
-    table: &crate::sources::postgres::ResolvedPostgresTable,
-) -> bool {
-    let live_destination_rows = if table.soft_delete {
-        destination_summary
-            .row_count
-            .saturating_sub(destination_summary.deleted_rows)
-    } else {
-        destination_summary.row_count
-    };
-    source_summary.row_count == live_destination_rows
 }
 
 async fn load_latest_postgres_checkpoint(
@@ -319,22 +281,22 @@ async fn main() -> Result<()> {
         }
         Commands::Run { config, connection } => cmd_run(config, connection).await,
         Commands::Migrate { config } => cmd_migrate(config).await,
-        Commands::Status { config, connection } => cmd_status(config, connection).await,
+        Commands::Status { config, connection } => ops::cmd_status(config, connection).await,
         Commands::Validate {
             config,
             connection,
             verbose,
-        } => cmd_validate(config, connection, verbose).await,
+        } => ops::cmd_validate(config, connection, verbose).await,
         Commands::Report {
             config,
             connection,
             limit,
-        } => cmd_report(config, connection, limit).await,
+        } => ops::cmd_report(config, connection, limit).await,
         Commands::Reconcile {
             config,
             connection,
             table,
-        } => cmd_reconcile(config, connection, table).await,
+        } => ops::cmd_reconcile(config, connection, table).await,
     }
 }
 
@@ -982,197 +944,6 @@ async fn cmd_run(config_path: PathBuf, connection_id: String) -> Result<()> {
     result
 }
 
-async fn cmd_status(config_path: PathBuf, connection: Option<String>) -> Result<()> {
-    let cfg = Config::load(&config_path).await?;
-    let _telemetry = telemetry::init(cfg.logging.as_ref(), cfg.observability.as_ref())?;
-    let state = SyncState::load_with_config(&cfg.state).await?;
-    if let Some(connection_id) = connection {
-        let connection_state = state.connections.get(&connection_id);
-        let output = serde_json::to_string_pretty(&connection_state)?;
-        println!("{}", output);
-    } else {
-        let output = serde_json::to_string_pretty(&state)?;
-        println!("{}", output);
-    }
-    Ok(())
-}
-
-async fn cmd_validate(
-    config_path: PathBuf,
-    connection_filter: Option<String>,
-    verbose: bool,
-) -> Result<()> {
-    let cfg = Config::load(&config_path).await?;
-    let _telemetry = telemetry::init(cfg.logging.as_ref(), cfg.observability.as_ref())?;
-    let metadata = cfg.metadata_columns();
-
-    let mut matched = false;
-    for connection in &cfg.connections {
-        if let Some(filter) = &connection_filter
-            && &connection.id != filter
-        {
-            continue;
-        }
-        matched = true;
-
-        if connection_filter.is_none() && !connection.enabled() {
-            continue;
-        }
-
-        match &connection.source {
-            SourceConfig::Postgres(pg) => {
-                let source = PostgresSource::new(pg.clone(), metadata.clone()).await?;
-                if source.cdc_enabled() {
-                    let tables = source.resolve_tables().await?;
-                    source.validate_cdc_publication(&tables, verbose).await?;
-                    info!(connection = %connection.id, "validated postgres CDC publication filters");
-                } else {
-                    info!(connection = %connection.id, "postgres CDC disabled; skipping publication validation");
-                }
-            }
-            SourceConfig::Salesforce(_) => {
-                info!(connection = %connection.id, "salesforce validation skipped");
-            }
-        }
-    }
-
-    if connection_filter.is_some() && !matched {
-        anyhow::bail!("connection not found");
-    }
-
-    println!("Validation complete.");
-    Ok(())
-}
-
-async fn cmd_report(
-    config_path: PathBuf,
-    connection_filter: Option<String>,
-    limit: usize,
-) -> Result<()> {
-    let cfg = Config::load(&config_path).await?;
-    let _telemetry = telemetry::init(cfg.logging.as_ref(), cfg.observability.as_ref())?;
-    let state = SyncState::load_with_config(&cfg.state).await?;
-    let state_value = if let Some(connection_id) = &connection_filter {
-        serde_json::to_value(state.connections.get(connection_id))?
-    } else {
-        serde_json::to_value(&state)?
-    };
-
-    let recent_runs = if let Some(stats_cfg) = &cfg.stats {
-        StatsDb::new(stats_cfg, &cfg.state.url)
-            .await?
-            .recent_runs(connection_filter.as_deref(), limit)
-            .await?
-    } else {
-        Vec::new()
-    };
-
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&ReportOutput {
-            state: state_value,
-            recent_runs,
-        })?
-    );
-    Ok(())
-}
-
-async fn cmd_reconcile(
-    config_path: PathBuf,
-    connection_id: String,
-    table_filter: Option<String>,
-) -> Result<()> {
-    let cfg = Config::load(&config_path).await?;
-    let _telemetry = telemetry::init(cfg.logging.as_ref(), cfg.observability.as_ref())?;
-    let metadata = cfg.metadata_columns();
-
-    let connection = cfg
-        .connections
-        .iter()
-        .find(|connection| connection.id == connection_id)
-        .context("connection not found")?;
-
-    let output = match (&connection.source, &connection.destination) {
-        (SourceConfig::Postgres(pg), DestinationConfig::BigQuery(bq)) => {
-            let source = PostgresSource::new(pg.clone(), metadata.clone()).await?;
-            let dest = BigQueryDestination::new(bq.clone(), false, metadata.clone()).await?;
-            let tables = source.resolve_tables().await?;
-            let selected_tables: Vec<_> = if let Some(table_filter) = &table_filter {
-                tables
-                    .into_iter()
-                    .filter(|table| &table.name == table_filter)
-                    .collect()
-            } else {
-                tables
-            };
-
-            if selected_tables.is_empty() {
-                anyhow::bail!("no matching tables selected for reconciliation");
-            }
-
-            let mut reports = Vec::with_capacity(selected_tables.len());
-            for table in selected_tables {
-                let destination_table = crate::types::destination_table_name(&table.name);
-                let report = match (
-                    source.summarize_table(&table).await,
-                    dest.summarize_table(&destination_table).await,
-                ) {
-                    (Ok(source_summary), Ok(dest_summary)) => TableReconciliationReport {
-                        source_table: table.name.clone(),
-                        destination_table,
-                        source_row_count: Some(source_summary.row_count),
-                        destination_row_count: Some(dest_summary.row_count),
-                        deleted_rows: Some(dest_summary.deleted_rows),
-                        source_max_updated_at: source_summary.max_updated_at,
-                        destination_max_synced_at: dest_summary.max_synced_at,
-                        count_match: Some(reconcile_count_match(
-                            &source_summary,
-                            &dest_summary,
-                            &table,
-                        )),
-                        error: None,
-                    },
-                    (Err(err), _) => TableReconciliationReport {
-                        source_table: table.name.clone(),
-                        destination_table,
-                        source_row_count: None,
-                        destination_row_count: None,
-                        deleted_rows: None,
-                        source_max_updated_at: None,
-                        destination_max_synced_at: None,
-                        count_match: None,
-                        error: Some(format!("source summary failed: {err}")),
-                    },
-                    (_, Err(err)) => TableReconciliationReport {
-                        source_table: table.name.clone(),
-                        destination_table,
-                        source_row_count: None,
-                        destination_row_count: None,
-                        deleted_rows: None,
-                        source_max_updated_at: None,
-                        destination_max_synced_at: None,
-                        count_match: None,
-                        error: Some(format!("destination summary failed: {err}")),
-                    },
-                };
-                if let Some(count_match) = report.count_match {
-                    telemetry::record_reconcile_table(&connection_id, count_match);
-                }
-                reports.push(report);
-            }
-
-            ReconciliationOutput {
-                connection_id,
-                tables: reports,
-            }
-        }
-        _ => anyhow::bail!("reconcile currently supports postgres -> bigquery connections only"),
-    };
-
-    println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(())
-}
-
 async fn wait_backoff(duration: Duration, shutdown: Option<ShutdownSignal>) -> bool {
     if let Some(mut shutdown) = shutdown {
         tokio::select! {
@@ -1199,254 +970,5 @@ async fn wait_for_termination_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
-    }
-}
-
-#[cfg(test)]
-mod reconcile_tests {
-    use super::*;
-
-    #[test]
-    fn reconcile_count_match_accounts_for_soft_deleted_rows() {
-        let source = crate::sources::postgres::PostgresTableSummary {
-            row_count: 10,
-            max_updated_at: None,
-        };
-        let destination = crate::destinations::bigquery::DestinationTableSummary {
-            row_count: 12,
-            max_synced_at: None,
-            deleted_rows: 2,
-        };
-        let table = crate::sources::postgres::ResolvedPostgresTable {
-            name: "public.items".to_string(),
-            primary_key: "id".to_string(),
-            updated_at_column: Some("updated_at".to_string()),
-            soft_delete: true,
-            soft_delete_column: Some("deleted_at".to_string()),
-            where_clause: None,
-            columns: crate::config::ColumnSelection {
-                include: Vec::new(),
-                exclude: Vec::new(),
-            },
-        };
-
-        assert!(reconcile_count_match(&source, &destination, &table));
-    }
-
-    #[test]
-    fn reconcile_count_match_uses_raw_count_without_soft_delete() {
-        let source = crate::sources::postgres::PostgresTableSummary {
-            row_count: 10,
-            max_updated_at: None,
-        };
-        let destination = crate::destinations::bigquery::DestinationTableSummary {
-            row_count: 12,
-            max_synced_at: None,
-            deleted_rows: 2,
-        };
-        let table = crate::sources::postgres::ResolvedPostgresTable {
-            name: "public.items".to_string(),
-            primary_key: "id".to_string(),
-            updated_at_column: Some("updated_at".to_string()),
-            soft_delete: false,
-            soft_delete_column: None,
-            where_clause: None,
-            columns: crate::config::ColumnSelection {
-                include: Vec::new(),
-                exclude: Vec::new(),
-            },
-        };
-
-        assert!(!reconcile_count_match(&source, &destination, &table));
-    }
-}
-
-#[cfg(test)]
-mod sync_selection_tests {
-    use super::*;
-    use uuid::Uuid;
-
-    fn postgres_connection(id: &str, enabled: Option<bool>) -> crate::config::ConnectionConfig {
-        crate::config::ConnectionConfig {
-            id: id.to_string(),
-            enabled,
-            source: crate::config::SourceConfig::Postgres(crate::config::PostgresConfig {
-                url: "postgres://localhost/test".to_string(),
-                tables: Some(vec![crate::config::PostgresTableConfig {
-                    name: "public.accounts".to_string(),
-                    primary_key: Some("id".to_string()),
-                    updated_at_column: Some("updated_at".to_string()),
-                    soft_delete: Some(false),
-                    soft_delete_column: None,
-                    where_clause: None,
-                    columns: None,
-                }]),
-                table_selection: None,
-                batch_size: Some(1000),
-                cdc: Some(false),
-                publication: None,
-                schema_changes: Some(crate::config::SchemaChangePolicy::Auto),
-                cdc_pipeline_id: None,
-                cdc_batch_size: None,
-                cdc_max_fill_ms: None,
-                cdc_max_pending_events: None,
-                cdc_idle_timeout_seconds: None,
-                cdc_tls: None,
-                cdc_tls_ca_path: None,
-                cdc_tls_ca: None,
-            }),
-            destination: crate::config::DestinationConfig::BigQuery(
-                crate::config::BigQueryConfig {
-                    project_id: "project".to_string(),
-                    dataset: "dataset".to_string(),
-                    location: Some("US".to_string()),
-                    service_account_key_path: None,
-                    service_account_key: None,
-                    partition_by_synced_at: Some(false),
-                    storage_write_enabled: Some(false),
-                    batch_load_bucket: None,
-                    batch_load_prefix: None,
-                    emulator_http: Some("http://localhost:9050".to_string()),
-                    emulator_grpc: Some("localhost:9051".to_string()),
-                },
-            ),
-            schedule: None,
-        }
-    }
-
-    #[test]
-    fn select_sync_connections_errors_when_filter_missing() {
-        let connections = vec![postgres_connection("app", Some(true))];
-
-        let error = select_sync_connections(&connections, Some("missing"))
-            .expect_err("missing connection should fail");
-
-        assert!(error.to_string().contains("connection not found"));
-    }
-
-    #[test]
-    fn select_sync_connections_errors_when_filtered_connection_is_disabled() {
-        let connections = vec![postgres_connection("app", Some(false))];
-
-        let error = select_sync_connections(&connections, Some("app"))
-            .expect_err("disabled filtered connection should fail");
-
-        assert!(error.to_string().contains("disabled"));
-    }
-
-    #[test]
-    fn select_sync_connections_returns_only_enabled_connections_without_filter() {
-        let connections = vec![
-            postgres_connection("enabled", Some(true)),
-            postgres_connection("disabled", Some(false)),
-            postgres_connection("default_enabled", None),
-        ];
-
-        let selected = select_sync_connections(&connections, None).expect("selection succeeds");
-        let ids: Vec<&str> = selected
-            .iter()
-            .map(|connection| connection.id.as_str())
-            .collect();
-
-        assert_eq!(ids, vec!["enabled", "default_enabled"]);
-    }
-
-    fn test_state_config() -> Option<crate::config::StateConfig> {
-        let url = std::env::var("CDSYNC_E2E_PG_URL").ok()?;
-        Some(crate::config::StateConfig {
-            url,
-            schema: Some(format!("cdsync_state_test_{}", Uuid::new_v4().simple())),
-        })
-    }
-
-    #[tokio::test]
-    async fn load_latest_postgres_checkpoint_prefers_persisted_progress() -> anyhow::Result<()> {
-        let Some(config) = test_state_config() else {
-            return Ok(());
-        };
-        SyncStateStore::migrate_with_config(&config).await?;
-        let store = SyncStateStore::open_with_config(&config).await?;
-        let handle = store.handle("app");
-        let persisted = TableCheckpoint {
-            last_primary_key: Some("42".to_string()),
-            ..Default::default()
-        };
-        handle
-            .save_postgres_checkpoint("public.accounts", &persisted)
-            .await?;
-
-        let fallback = TableCheckpoint {
-            last_primary_key: Some("1".to_string()),
-            ..Default::default()
-        };
-        let loaded = load_latest_postgres_checkpoint(&handle, "public.accounts", &fallback).await;
-
-        assert_eq!(loaded.last_primary_key.as_deref(), Some("42"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn load_latest_salesforce_checkpoint_prefers_persisted_progress() -> anyhow::Result<()> {
-        let Some(config) = test_state_config() else {
-            return Ok(());
-        };
-        SyncStateStore::migrate_with_config(&config).await?;
-        let store = SyncStateStore::open_with_config(&config).await?;
-        let handle = store.handle("app");
-        let persisted = TableCheckpoint {
-            last_primary_key: Some("42".to_string()),
-            ..Default::default()
-        };
-        handle
-            .save_salesforce_checkpoint("Account", &persisted)
-            .await?;
-
-        let fallback = TableCheckpoint {
-            last_primary_key: Some("1".to_string()),
-            ..Default::default()
-        };
-        let loaded = load_latest_salesforce_checkpoint(&handle, "Account", &fallback).await;
-
-        assert_eq!(loaded.last_primary_key.as_deref(), Some("42"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn refresh_postgres_checkpoints_from_store_overwrites_stale_in_memory_state()
-    -> anyhow::Result<()> {
-        let Some(config) = test_state_config() else {
-            return Ok(());
-        };
-        SyncStateStore::migrate_with_config(&config).await?;
-        let store = SyncStateStore::open_with_config(&config).await?;
-        let handle = store.handle("app");
-
-        let persisted = TableCheckpoint {
-            last_primary_key: Some("99".to_string()),
-            ..Default::default()
-        };
-        handle
-            .save_postgres_checkpoint("public.accounts", &persisted)
-            .await?;
-
-        let mut state = ConnectionState::default();
-        state.postgres.insert(
-            "public.accounts".to_string(),
-            TableCheckpoint {
-                last_primary_key: Some("1".to_string()),
-                ..Default::default()
-            },
-        );
-
-        refresh_postgres_checkpoints_from_store(&handle, &mut state).await;
-
-        assert_eq!(
-            state
-                .postgres
-                .get("public.accounts")
-                .and_then(|checkpoint| checkpoint.last_primary_key.as_deref()),
-            Some("99")
-        );
-        Ok(())
     }
 }
