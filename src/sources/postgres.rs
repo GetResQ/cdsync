@@ -36,10 +36,9 @@ use postgres_replication::protocol::{LogicalReplicationMessage, ReplicationMessa
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::Connection;
 use sqlx::Row as SqlxRow;
 use sqlx::ValueRef;
-use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions, PgRow};
+use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
@@ -49,7 +48,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tokio_postgres::config::ReplicationMode;
-use tokio_postgres::{Client as TokioPgClient, NoTls, SimpleQueryMessage};
+use tokio_postgres::{Client as TokioPgClient, NoTls, Row as TokioPgRow, SimpleQueryMessage};
 use tracing::{info, warn};
 use url::Url;
 use uuid::Uuid;
@@ -84,6 +83,17 @@ struct ExportedSnapshotSlotInfo {
 struct CdcSnapshotTask {
     table: ResolvedPostgresTable,
     info: CdcTableInfo,
+    checkpoint: TableCheckpoint,
+    state_handle: Option<StateHandle>,
+}
+
+struct SnapshotCopyContext<'a> {
+    dest: &'a dyn Destination,
+    snapshot_name: &'a str,
+    batch_size: usize,
+    stats: Option<StatsHandle>,
+    checkpoint: TableCheckpoint,
+    state_handle: Option<StateHandle>,
 }
 
 const DEFAULT_PG_POOL_MAX: u32 = 5;
@@ -715,7 +725,25 @@ impl PostgresSource {
                     .get(table_id)
                     .cloned()
                     .context("missing table info for CDC snapshot")?;
-                snapshot_tasks_to_run.push(CdcSnapshotTask { table, info });
+                let checkpoint = {
+                    let entry = state.postgres.entry(table.name.clone()).or_default();
+                    if let Some(schema_hash) = table_hashes.get(table_id) {
+                        entry.schema_hash = Some(schema_hash.clone());
+                    }
+                    if let Some(snapshot) = table_snapshots.get(table_id) {
+                        entry.schema_snapshot = Some(snapshot.clone());
+                    }
+                    if let Some(state_handle) = &state_handle {
+                        state_handle.save_postgres_checkpoint(&table.name, entry).await?;
+                    }
+                    entry.clone()
+                };
+                snapshot_tasks_to_run.push(CdcSnapshotTask {
+                    table,
+                    info,
+                    checkpoint,
+                    state_handle: state_handle.clone(),
+                });
             }
 
             let semaphore = Arc::new(tokio::sync::Semaphore::new(snapshot_concurrency));
@@ -743,10 +771,14 @@ impl PostgresSource {
                         .run_snapshot_copy_with_exported_snapshot(
                             &snapshot_task.table,
                             &snapshot_task.info.schema,
-                            &dest,
-                            &snapshot_name,
-                            batch_size,
-                            stats,
+                            SnapshotCopyContext {
+                                dest: &dest,
+                                snapshot_name: &snapshot_name,
+                                batch_size,
+                                stats,
+                                checkpoint: snapshot_task.checkpoint,
+                                state_handle: snapshot_task.state_handle,
+                            },
                         )
                         .await
                         .with_context(|| {
@@ -1154,16 +1186,7 @@ impl PostgresSource {
     ) -> Result<(ExportedSnapshotSlot, ExportedSnapshotSlotInfo)> {
         let pg_config = self.build_pg_connection_config().await?;
         let client = connect_replication_control_client(&pg_config).await?;
-        client
-            .simple_query("BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ")
-            .await?;
-        let info = match create_exported_snapshot_slot_info(&client, slot_name).await {
-            Ok(info) => info,
-            Err(err) => {
-                let _ = client.simple_query("ROLLBACK").await;
-                return Err(err);
-            }
-        };
+        let info = create_exported_snapshot_slot_info(&client, slot_name).await?;
         Ok((
             ExportedSnapshotSlot {
                 client: Some(client),
@@ -1176,11 +1199,16 @@ impl PostgresSource {
         &self,
         table: &ResolvedPostgresTable,
         schema: &TableSchema,
-        dest: &dyn Destination,
-        snapshot_name: &str,
-        batch_size: usize,
-        stats: Option<StatsHandle>,
+        ctx: SnapshotCopyContext<'_>,
     ) -> Result<()> {
+        let SnapshotCopyContext {
+            dest,
+            snapshot_name,
+            batch_size,
+            stats,
+            mut checkpoint,
+            state_handle,
+        } = ctx;
         let (schema_name, table_name) = split_table_name(&table.name);
 
         if !schema.columns.is_empty() {
@@ -1215,21 +1243,8 @@ impl PostgresSource {
                 table = table_name
             )
         };
-        let sql_without_pk = format!("{} ORDER BY {} LIMIT $1", base_sql, table.primary_key);
-        let sql_with_pk = if has_where {
-            format!(
-                "{} AND {} > $1::{} ORDER BY {} LIMIT $2",
-                base_sql, table.primary_key, pk_cast, table.primary_key
-            )
-        } else {
-            format!(
-                "{} WHERE {} > $1::{} ORDER BY {} LIMIT $2",
-                base_sql, table.primary_key, pk_cast, table.primary_key
-            )
-        };
-
-        let mut connection =
-            acquire_exported_snapshot_reader(&self.config.url, snapshot_name).await?;
+        let pg_config = self.build_pg_connection_config().await?;
+        let connection = acquire_exported_snapshot_reader(&pg_config, snapshot_name).await?;
         let mut last_pk: Option<String> = None;
         let mut extracted_rows = 0usize;
         let mut loaded_batches = 0usize;
@@ -1239,16 +1254,32 @@ impl PostgresSource {
             loop {
                 let extract_start = Instant::now();
                 let rows = if let Some(last_pk_value) = last_pk.as_ref() {
-                    sqlx::query(&sql_with_pk)
-                        .bind(last_pk_value)
-                        .bind(batch_size as i64)
-                        .fetch_all(&mut connection)
-                        .await?
+                    let query = if has_where {
+                        format!(
+                            "{base_sql} AND {pk} > {last_pk}::{pk_cast} ORDER BY {pk} LIMIT {limit}",
+                            base_sql = base_sql,
+                            pk = table.primary_key,
+                            last_pk = quote_pg_literal(last_pk_value),
+                            pk_cast = pk_cast,
+                            limit = batch_size,
+                        )
+                    } else {
+                        format!(
+                            "{base_sql} WHERE {pk} > {last_pk}::{pk_cast} ORDER BY {pk} LIMIT {limit}",
+                            base_sql = base_sql,
+                            pk = table.primary_key,
+                            last_pk = quote_pg_literal(last_pk_value),
+                            pk_cast = pk_cast,
+                            limit = batch_size,
+                        )
+                    };
+                    connection.query(&query, &[]).await?
                 } else {
-                    sqlx::query(&sql_without_pk)
-                        .bind(batch_size as i64)
-                        .fetch_all(&mut connection)
-                        .await?
+                    let query = format!(
+                        "{} ORDER BY {} LIMIT {}",
+                        base_sql, table.primary_key, batch_size
+                    );
+                    connection.query(&query, &[]).await?
                 };
                 let extract_ms = extract_start.elapsed().as_millis() as u64;
 
@@ -1257,7 +1288,8 @@ impl PostgresSource {
                 }
 
                 extracted_rows += rows.len();
-                let batch = rows_to_batch(schema, &rows, table, Utc::now(), &self.metadata)?;
+                let batch =
+                    tokio_rows_to_batch(schema, &rows, table, Utc::now(), &self.metadata)?;
                 if let Some(stats) = &stats {
                     stats
                         .record_extract(&table.name, rows.len(), extract_ms)
@@ -1298,9 +1330,16 @@ impl PostgresSource {
 
                 last_pk = Some(
                     rows.last()
-                        .and_then(|row| row.try_get(pk_alias).ok())
+                        .and_then(|row| row.try_get::<_, String>(pk_alias).ok())
                         .context("missing primary key value for snapshot pagination")?,
                 );
+                checkpoint.last_synced_at = Some(Utc::now());
+                checkpoint.last_primary_key = last_pk.clone();
+                if let Some(state_handle) = &state_handle {
+                    state_handle
+                        .save_postgres_checkpoint(&table.name, &checkpoint)
+                        .await?;
+                }
             }
 
             completed = true;
@@ -1308,8 +1347,15 @@ impl PostgresSource {
         }
         .await;
 
-        release_exported_snapshot_reader(&mut connection, completed).await?;
+        release_exported_snapshot_reader(&connection, completed).await?;
         run_result?;
+
+        checkpoint.last_synced_at = Some(Utc::now());
+        if let Some(state_handle) = &state_handle {
+            state_handle
+                .save_postgres_checkpoint(&table.name, &checkpoint)
+                .await?;
+        }
 
         info!(
             table = %table.name,
@@ -2050,6 +2096,45 @@ async fn connect_replication_control_client(
     }
 }
 
+async fn connect_snapshot_reader_client(pg_config: &PgConnectionConfig) -> Result<TokioPgClient> {
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host(pg_config.host.clone())
+        .port(pg_config.port)
+        .dbname(pg_config.name.clone())
+        .user(pg_config.username.clone());
+
+    if let Some(password) = &pg_config.password {
+        config.password(password.expose_secret());
+    }
+
+    if pg_config.tls.enabled {
+        let mut builder = native_tls::TlsConnector::builder();
+        if !pg_config.tls.trusted_root_certs.is_empty() {
+            builder.add_root_certificate(Certificate::from_pem(
+                pg_config.tls.trusted_root_certs.as_bytes(),
+            )?);
+        }
+        let connector = MakeNativeTlsConnect::new(builder.build()?);
+        let (client, connection) = config.connect(connector).await?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::error!(error = %err, "exported snapshot reader connection error");
+            }
+        });
+        Ok(client)
+    } else {
+        config.ssl_mode(tokio_postgres::config::SslMode::Prefer);
+        let (client, connection) = config.connect(NoTls).await?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::error!(error = %err, "exported snapshot reader connection error");
+            }
+        });
+        Ok(client)
+    }
+}
+
 async fn create_exported_snapshot_slot_info(
     client: &TokioPgClient,
     slot_name: &str,
@@ -2082,20 +2167,23 @@ async fn create_exported_snapshot_slot_info(
     anyhow::bail!("replication slot creation returned no row")
 }
 
-async fn acquire_exported_snapshot_reader(url: &str, snapshot_name: &str) -> Result<PgConnection> {
-    let mut connection = PgConnection::connect(url).await?;
-    sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        .execute(&mut connection)
+async fn acquire_exported_snapshot_reader(
+    pg_config: &PgConnectionConfig,
+    snapshot_name: &str,
+) -> Result<TokioPgClient> {
+    let connection = connect_snapshot_reader_client(pg_config).await?;
+    connection
+        .simple_query("BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ;")
         .await
         .with_context(|| "starting exported snapshot reader transaction")?;
-    if let Err(err) = sqlx::query(&format!(
-        "SET TRANSACTION SNAPSHOT {}",
-        quote_pg_literal(snapshot_name)
-    ))
-    .execute(&mut connection)
-    .await
+    if let Err(err) = connection
+        .simple_query(&format!(
+            "SET TRANSACTION SNAPSHOT {}",
+            quote_pg_literal(snapshot_name)
+        ))
+        .await
     {
-        let _ = sqlx::query("ROLLBACK").execute(&mut connection).await;
+        let _ = connection.simple_query("ROLLBACK;").await;
         return Err(err).with_context(|| {
             format!(
                 "importing exported snapshot {} into snapshot reader transaction",
@@ -2106,20 +2194,20 @@ async fn acquire_exported_snapshot_reader(url: &str, snapshot_name: &str) -> Res
     Ok(connection)
 }
 
-async fn release_exported_snapshot_reader(connection: &mut PgConnection, commit: bool) -> Result<()> {
-    let statement = if commit { "COMMIT" } else { "ROLLBACK" };
-    sqlx::query(statement).execute(&mut *connection).await?;
+async fn release_exported_snapshot_reader(
+    connection: &TokioPgClient,
+    commit: bool,
+) -> Result<()> {
+    let statement = if commit { "COMMIT;" } else { "ROLLBACK;" };
+    connection.simple_query(statement).await?;
     Ok(())
 }
 
 async fn release_exported_snapshot_slot(
     mut slot: ExportedSnapshotSlot,
-    commit: bool,
+    _commit: bool,
 ) -> Result<()> {
-    let statement = if commit { "COMMIT" } else { "ROLLBACK" };
-    if let Some(client) = slot.client.take() {
-        client.simple_query(statement).await?;
-    }
+    let _ = slot.client.take();
     Ok(())
 }
 
@@ -2138,7 +2226,9 @@ fn build_select_columns(schema: &TableSchema) -> String {
         .map(|column| {
             let ident = quote_pg_identifier(&column.name);
             match column.data_type {
-                DataType::String => format!("{ident}::text as {ident}"),
+                DataType::String | DataType::Numeric | DataType::Json => {
+                    format!("{ident}::text as {ident}")
+                }
                 _ => ident,
             }
         })

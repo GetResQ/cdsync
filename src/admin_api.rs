@@ -5,7 +5,8 @@ use crate::config::{
 };
 use crate::runner::ShutdownSignal;
 use crate::state::{ConnectionState, SyncStateStore};
-use crate::stats::{RunSummary, StatsDb};
+use crate::stats::{RunSummary, StatsDb, TableStatsSnapshot};
+use crate::types::TableCheckpoint;
 use anyhow::Context;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -93,6 +94,21 @@ struct ConnectionDetail {
 struct CheckpointResponse {
     connection_id: String,
     state: Option<ConnectionState>,
+}
+
+#[derive(Serialize)]
+struct ProgressResponse {
+    connection_id: String,
+    state: Option<ConnectionState>,
+    current_run: Option<RunSummary>,
+    tables: Vec<TableProgress>,
+}
+
+#[derive(Serialize)]
+struct TableProgress {
+    table_name: String,
+    checkpoint: Option<TableCheckpoint>,
+    stats: Option<TableStatsSnapshot>,
 }
 
 #[derive(Serialize)]
@@ -246,6 +262,7 @@ pub async fn spawn_admin_api(
         .route("/v1/connections", get(connections))
         .route("/v1/connections/{id}", get(connection))
         .route("/v1/connections/{id}/checkpoints", get(checkpoints))
+        .route("/v1/connections/{id}/progress", get(progress))
         .route("/v1/connections/{id}/runs", get(runs))
         .with_state(state);
 
@@ -355,6 +372,54 @@ async fn runs(
     let limit = query.limit.unwrap_or(20).max(1);
     let runs = stats.recent_runs(Some(&connection_id), limit).await?;
     Ok(Json(runs))
+}
+
+async fn progress(
+    State(state): State<AdminApiState>,
+    Path(connection_id): Path<String>,
+) -> Result<Json<ProgressResponse>, AdminApiError> {
+    let sync_state = state.state_store.load_state().await?;
+    let connection_state = sync_state.connections.get(&connection_id).cloned();
+    let (current_run, run_tables) = if let Some(stats_db) = &state.stats_db {
+        let runs = stats_db.recent_runs(Some(&connection_id), 1).await?;
+        if let Some(run) = runs.into_iter().next() {
+            let tables = stats_db.run_tables(&run.run_id).await?;
+            (Some(run), tables)
+        } else {
+            (None, Vec::new())
+        }
+    } else {
+        (None, Vec::new())
+    };
+
+    let mut table_names = std::collections::BTreeSet::new();
+    if let Some(state) = &connection_state {
+        table_names.extend(state.postgres.keys().cloned());
+    }
+    table_names.extend(run_tables.iter().map(|table| table.table_name.clone()));
+
+    let run_table_map: std::collections::HashMap<_, _> = run_tables
+        .into_iter()
+        .map(|table| (table.table_name.clone(), table))
+        .collect();
+
+    let tables = table_names
+        .into_iter()
+        .map(|table_name| TableProgress {
+            checkpoint: connection_state
+                .as_ref()
+                .and_then(|state| state.postgres.get(&table_name).cloned()),
+            stats: run_table_map.get(&table_name).cloned(),
+            table_name,
+        })
+        .collect();
+
+    Ok(Json(ProgressResponse {
+        connection_id,
+        state: connection_state,
+        current_run,
+        tables,
+    }))
 }
 
 fn scrub_config(cfg: &Config) -> ScrubbedConfig {

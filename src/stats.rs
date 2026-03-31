@@ -102,7 +102,7 @@ impl StatsHandle {
             connection_id: connection_id.to_string(),
             started_at: Utc::now(),
             finished_at: None,
-            status: None,
+            status: Some("running".to_string()),
             error: None,
             rows_read: 0,
             rows_written: 0,
@@ -436,6 +436,46 @@ impl StatsDb {
                     load_ms: row.try_get("load_ms")?,
                     api_calls: row.try_get("api_calls")?,
                     rate_limit_hits: row.try_get("rate_limit_hits")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn run_tables(&self, run_id: &str) -> anyhow::Result<Vec<TableStatsSnapshot>> {
+        let rows = sqlx::query(&format!(
+            r#"
+            select
+                run_id,
+                connection_id,
+                table_name,
+                rows_read,
+                rows_written,
+                rows_deleted,
+                rows_upserted,
+                extract_ms,
+                load_ms
+            from {}
+            where run_id = $1
+            order by rows_read desc, table_name asc
+            "#,
+            self.table("run_tables")
+        ))
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(TableStatsSnapshot {
+                    run_id: row.try_get("run_id")?,
+                    connection_id: row.try_get("connection_id")?,
+                    table_name: row.try_get("table_name")?,
+                    rows_read: row.try_get("rows_read")?,
+                    rows_written: row.try_get("rows_written")?,
+                    rows_deleted: row.try_get("rows_deleted")?,
+                    rows_upserted: row.try_get("rows_upserted")?,
+                    extract_ms: row.try_get("extract_ms")?,
+                    load_ms: row.try_get("load_ms")?,
                 })
             })
             .collect()

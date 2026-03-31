@@ -26,8 +26,11 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, oneshot};
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
+
+const LIVE_STATS_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Parser, Debug)]
 #[command(name = "cdsync", version, about = "CDSync - Open-source data sync")]
@@ -154,6 +157,11 @@ struct TableReconciliationReport {
     error: Option<String>,
 }
 
+struct StatsFlushHandle {
+    stop_tx: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
 fn select_sync_connections<'a>(
     connections: &'a [crate::config::ConnectionConfig],
     filter: Option<&str>,
@@ -173,6 +181,40 @@ fn select_sync_connections<'a>(
         .iter()
         .filter(|connection| connection.enabled())
         .collect())
+}
+
+fn spawn_stats_flush_task(db: StatsDb, handle: StatsHandle) -> StatsFlushHandle {
+    let (stop_tx, mut stop_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(LIVE_STATS_FLUSH_INTERVAL) => {
+                    if let Err(err) = db.persist_run(&handle).await {
+                        warn!(error = %err, "failed to persist live run stats");
+                    }
+                }
+                _ = &mut stop_rx => {
+                    break;
+                }
+            }
+        }
+    });
+    StatsFlushHandle {
+        stop_tx: Some(stop_tx),
+        task,
+    }
+}
+
+async fn stop_stats_flush_task(flush: Option<StatsFlushHandle>) {
+    let Some(mut flush) = flush else {
+        return;
+    };
+    if let Some(stop_tx) = flush.stop_tx.take() {
+        let _ = stop_tx.send(());
+    }
+    if let Err(err) = flush.task.await {
+        warn!(error = %err, "stats flush task join failed");
+    }
 }
 
 fn reconcile_count_match(
@@ -407,6 +449,11 @@ async fn cmd_sync(request: SyncCommandRequest) -> Result<()> {
         state_handle.save_connection_meta(connection_state).await?;
 
         let stats_handle = stats_db.as_ref().map(|_| StatsHandle::new(&connection.id));
+        let mut stats_flush = None;
+        if let (Some(db), Some(handle)) = (&stats_db, &stats_handle) {
+            db.persist_run(handle).await?;
+            stats_flush = Some(spawn_stats_flush_task(db.clone(), handle.clone()));
+        }
         let run_id = match &stats_handle {
             Some(handle) => Some(handle.run_id().await),
             None => None,
@@ -461,6 +508,7 @@ async fn cmd_sync(request: SyncCommandRequest) -> Result<()> {
                 );
             }
         }
+        stop_stats_flush_task(stats_flush).await;
         if let Some(handle) = &stats_handle {
             let status = if result.is_ok() { "success" } else { "failed" };
             handle.finish(status, error_string).await;

@@ -20,6 +20,12 @@ async fn postgres_stats_db_migrate_creates_schema_and_tables() -> anyhow::Result
     StatsDb::migrate_with_config(&config, &default_url).await?;
     let db = StatsDb::new(&config, &default_url).await?;
     let stats = StatsHandle::new("app");
+    db.persist_run(&stats).await?;
+
+    let runs = db.recent_runs(Some("app"), 5).await?;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status.as_deref(), Some("running"));
+
     stats.finish("success", None).await;
     db.persist_run(&stats).await?;
 

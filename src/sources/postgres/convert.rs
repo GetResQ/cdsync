@@ -44,6 +44,36 @@ pub(super) fn rows_to_batch(
     DataFrame::from_rows_and_schema(&output, &polars_schema).map_err(Into::into)
 }
 
+pub(super) fn tokio_rows_to_batch(
+    schema: &TableSchema,
+    rows: &[TokioPgRow],
+    table: &ResolvedPostgresTable,
+    synced_at: DateTime<Utc>,
+    metadata: &MetadataColumns,
+) -> Result<DataFrame> {
+    let polars_schema = polars_schema_with_metadata(schema, metadata)?;
+    let mut output: Vec<PolarsRow> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut values: Vec<AnyValue> = Vec::with_capacity(polars_schema.len());
+        for column in &schema.columns {
+            let value = tokio_pg_value_to_anyvalue(row, column)?;
+            values.push(value);
+        }
+
+        values.push(AnyValue::StringOwned(PlSmallStr::from(
+            synced_at.to_rfc3339(),
+        )));
+        let deleted_at = derive_deleted_at_tokio(row, table).unwrap_or(Value::Null);
+        match deleted_at {
+            Value::String(value) => values.push(AnyValue::StringOwned(PlSmallStr::from(value))),
+            _ => values.push(AnyValue::Null),
+        }
+        output.push(PolarsRow::new(values));
+    }
+
+    DataFrame::from_rows_and_schema(&output, &polars_schema).map_err(Into::into)
+}
+
 pub(super) fn derive_deleted_at(row: &PgRow, table: &ResolvedPostgresTable) -> Option<Value> {
     if !table.soft_delete {
         return Some(Value::Null);
@@ -69,6 +99,35 @@ pub(super) fn derive_deleted_at(row: &PgRow, table: &ResolvedPostgresTable) -> O
     }
 
     if let Ok(date) = row.try_get::<NaiveDate, _>(column.as_str()) {
+        return Some(Value::String(date.format("%Y-%m-%d").to_string()));
+    }
+
+    Some(Value::Null)
+}
+
+pub(super) fn derive_deleted_at_tokio(
+    row: &TokioPgRow,
+    table: &ResolvedPostgresTable,
+) -> Option<Value> {
+    if !table.soft_delete {
+        return Some(Value::Null);
+    }
+    let column = table.soft_delete_column.as_ref()?;
+
+    if let Ok(Some(flag)) = row.try_get::<_, Option<bool>>(column.as_str())
+        && flag
+    {
+        return Some(Value::String(Utc::now().to_rfc3339()));
+    }
+
+    if let Ok(Some(ts)) = row.try_get::<_, Option<NaiveDateTime>>(column.as_str()) {
+        let dt = Utc.from_utc_datetime(&ts);
+        return Some(Value::String(dt.to_rfc3339()));
+    }
+    if let Ok(Some(ts)) = row.try_get::<_, Option<DateTime<Utc>>>(column.as_str()) {
+        return Some(Value::String(ts.to_rfc3339()));
+    }
+    if let Ok(Some(date)) = row.try_get::<_, Option<NaiveDate>>(column.as_str()) {
         return Some(Value::String(date.format("%Y-%m-%d").to_string()));
     }
 
@@ -117,12 +176,91 @@ pub(super) fn pg_value_to_anyvalue(
         DataType::Bytes => row
             .try_get::<Option<Vec<u8>>, _>(name)?
             .map(|v| AnyValue::StringOwned(PlSmallStr::from(encode_base64(&v)))),
+        DataType::Numeric => {
+            if let Ok(value) = row.try_get::<Option<bigdecimal::BigDecimal>, _>(name) {
+                value.map(|v| AnyValue::StringOwned(PlSmallStr::from(v.to_string())))
+            } else if let Ok(value) = row.try_get::<Option<String>, _>(name) {
+                value.map(|v| AnyValue::StringOwned(PlSmallStr::from(v)))
+            } else {
+                None
+            }
+        }
+        DataType::Json => {
+            if let Ok(value) = row.try_get::<Option<serde_json::Value>, _>(name) {
+                value.map(|v| AnyValue::StringOwned(PlSmallStr::from(v.to_string())))
+            } else if let Ok(value) = row.try_get::<Option<String>, _>(name) {
+                value.map(|v| AnyValue::StringOwned(PlSmallStr::from(v)))
+            } else {
+                None
+            }
+        }
+    };
+
+    Ok(value.unwrap_or(AnyValue::Null))
+}
+
+pub(super) fn tokio_pg_value_to_anyvalue(
+    row: &TokioPgRow,
+    column: &ColumnSchema,
+) -> Result<AnyValue<'static>> {
+    let name = column.name.as_str();
+    let value = match column.data_type {
+        DataType::String => row
+            .try_get::<_, Option<String>>(name)?
+            .map(|v| AnyValue::StringOwned(PlSmallStr::from(v))),
+        DataType::Int64 => {
+            if let Ok(value) = row.try_get::<_, Option<i64>>(name) {
+                value.map(AnyValue::Int64)
+            } else if let Ok(value) = row.try_get::<_, Option<i32>>(name) {
+                value.map(|v| AnyValue::Int64(v as i64))
+            } else if let Ok(value) = row.try_get::<_, Option<i16>>(name) {
+                value.map(|v| AnyValue::Int64(v as i64))
+            } else {
+                None
+            }
+        }
+        DataType::Float64 => {
+            if let Ok(value) = row.try_get::<_, Option<f64>>(name) {
+                value.map(AnyValue::Float64)
+            } else if let Ok(value) = row.try_get::<_, Option<f32>>(name) {
+                value.map(|v| AnyValue::Float64(v as f64))
+            } else {
+                None
+            }
+        }
+        DataType::Bool => row.try_get::<_, Option<bool>>(name)?.map(AnyValue::Boolean),
+        DataType::Timestamp => {
+            if let Ok(value) = row.try_get::<_, Option<NaiveDateTime>>(name) {
+                value
+                    .map(|v| Utc.from_utc_datetime(&v).to_rfc3339())
+                    .map(|v| AnyValue::StringOwned(PlSmallStr::from(v)))
+            } else if let Ok(value) = row.try_get::<_, Option<DateTime<Utc>>>(name) {
+                value
+                    .map(|v| v.to_rfc3339())
+                    .map(|v| AnyValue::StringOwned(PlSmallStr::from(v)))
+            } else {
+                None
+            }
+        }
+        DataType::Date => row
+            .try_get::<_, Option<NaiveDate>>(name)?
+            .map(|v| v.format("%Y-%m-%d").to_string())
+            .map(|v| AnyValue::StringOwned(PlSmallStr::from(v))),
+        DataType::Bytes => row
+            .try_get::<_, Option<Vec<u8>>>(name)?
+            .map(|v| AnyValue::StringOwned(PlSmallStr::from(encode_base64(&v)))),
         DataType::Numeric => row
-            .try_get::<Option<bigdecimal::BigDecimal>, _>(name)?
-            .map(|v| AnyValue::StringOwned(PlSmallStr::from(v.to_string()))),
-        DataType::Json => row
-            .try_get::<Option<serde_json::Value>, _>(name)?
-            .map(|v| AnyValue::StringOwned(PlSmallStr::from(v.to_string()))),
+            .try_get::<_, Option<String>>(name)?
+            .map(|v| AnyValue::StringOwned(PlSmallStr::from(v))),
+        DataType::Json => {
+            if let Ok(value) = row.try_get::<_, Option<serde_json::Value>>(name) {
+                value.map(|v| AnyValue::StringOwned(PlSmallStr::from(v.to_string())))
+            } else if let Ok(value) = row.try_get::<_, Option<String>>(name) {
+                value.map(|v| AnyValue::StringOwned(PlSmallStr::from(v)))
+            } else {
+                None
+            }
+        }
     };
 
     Ok(value.unwrap_or(AnyValue::Null))
