@@ -219,7 +219,10 @@ pub struct StatsDb {
 }
 
 impl StatsDb {
-    pub async fn migrate_with_config(config: &StatsConfig, default_url: &str) -> anyhow::Result<()> {
+    pub async fn migrate_with_config(
+        config: &StatsConfig,
+        default_url: &str,
+    ) -> anyhow::Result<()> {
         let url = config.url.as_deref().unwrap_or(default_url);
         let schema = config.schema_name().to_string();
         validate_schema_name(&schema)?;

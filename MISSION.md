@@ -1,23 +1,24 @@
 # Mission
 
-Mission: Build the first production-ready very-large-table snapshot strategy by chunking large PostgreSQL CDC snapshot tables by primary-key range while keeping small tables on the existing whole-table path.
+Mission: Replace NDJSON as the primary BigQuery GCS batch-load format with Parquet, while keeping a narrowly-scoped fallback only for schema types that are not yet safe to encode through the current Parquet path.
 
 ## Done Criteria
 
-1. Large CDC snapshot tables are detected automatically at runtime.
-2. Eligible tables are split into bounded PK-range chunks and copied in parallel under the existing snapshot concurrency limit.
-3. Small tables and unsupported PK types keep the current whole-table snapshot behavior.
-4. The change is covered by focused tests and passes formatting, tests, and clippy.
+1. BigQuery batch-load uploads use Parquet by default.
+2. Load jobs are configured for Parquet objects.
+3. The current frame-to-Parquet path preserves the supported BigQuery column types we already emit in bulk loads.
+4. Unsupported schema shapes fall back intentionally instead of silently writing invalid Parquet.
+5. The change is covered by focused tests and passes formatting, tests, and clippy.
 
 ## Guardrails
 
-- Do not regress correctness of initial snapshot output.
-- Do not make snapshot checkpoint state misleading or unsafe for resume semantics.
-- Keep the change bounded to the large-table strategy; do not mix in Parquet or resume-state redesign.
+- Keep the change bounded to the batch-load path; do not redesign the whole destination writer.
+- Do not regress emulator behavior or the non-batch-load append/upsert paths.
+- Do not claim Parquet support for schema types we cannot encode safely yet.
 - No compiler warnings, no clippy warnings, no broken tests.
 
 ## Critical Learnings
 
-- Decision: Limit the first chunking pass to CDC snapshot tables with single-column integer PKs (`int2`/`int4`/`int8`).
-- Decision: Detect “large” tables from runtime row-count and PK-range inspection instead of introducing new config knobs first.
-- Constraint: Current snapshot checkpoints are not rich enough to represent parallel per-chunk resume safely, so chunked snapshot tasks must avoid persisting ambiguous `last_primary_key` progress.
+- Decision: Use Parquet as the primary batch-load format immediately rather than adding a long-term config switch between NDJSON and Parquet.
+- Decision: Keep NDJSON only as a temporary compatibility path for schema types like `NUMERIC` and `JSON` that are not safely represented by the current DataFrame-to-Parquet conversion.
+- Constraint: The existing bulk frames store several logical types as strings, so supported Parquet loads need an explicit frame-to-typed-Parquet conversion step instead of writing the raw frame bytes directly.

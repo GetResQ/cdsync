@@ -1412,8 +1412,8 @@ mod sync_selection_tests {
     }
 
     #[tokio::test]
-    async fn refresh_postgres_checkpoints_from_store_overwrites_stale_in_memory_state(
-    ) -> anyhow::Result<()> {
+    async fn refresh_postgres_checkpoints_from_store_overwrites_stale_in_memory_state()
+    -> anyhow::Result<()> {
         let Some(config) = test_state_config() else {
             return Ok(());
         };

@@ -80,7 +80,10 @@ impl SyncState {
 impl SyncStateStore {
     pub async fn migrate_with_config(config: &StateConfig) -> anyhow::Result<()> {
         validate_schema_name(config.schema_name())?;
-        let pool = PgPoolOptions::new().max_connections(5).connect(&config.url).await?;
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&config.url)
+            .await?;
         let store = Self {
             pool,
             schema: config.schema_name().to_string(),
@@ -572,7 +575,6 @@ impl StateHandle {
             .load_all_table_checkpoints(&self.connection_id, "postgres")
             .await
     }
-
 }
 
 impl ConnectionLease {
