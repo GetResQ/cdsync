@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use anyhow::{Context, Result};
+use cdsync::config::StateConfig;
 use cdsync::state::SyncState;
 use std::env;
 use std::path::PathBuf;
@@ -50,15 +51,16 @@ async fn e2e_runner_polling_graceful_shutdown() -> Result<()> {
     .await?;
 
     let temp_dir = tempfile::tempdir()?;
-    let state_path = temp_dir.path().join("state.db");
-    let stats_path = temp_dir.path().join("stats.db");
+    let state_schema = format!("cdsync_state_runner_{}", &suffix[..8]);
+    let stats_schema = format!("cdsync_stats_runner_{}", &suffix[..8]);
     let config_path = temp_dir.path().join("config.yaml");
     tokio::fs::write(
         &config_path,
         format!(
             r#"
 state:
-  path: "{state_path}"
+  url: "{pg_url}"
+  schema: "{state_schema}"
 logging:
   level: "info"
   json: false
@@ -70,7 +72,8 @@ sync:
   retry_backoff_ms: 1000
   max_concurrency: 1
 stats:
-  path: "{stats_path}"
+  url: "{pg_url}"
+  schema: "{stats_schema}"
 connections:
   - id: "runner_demo"
     enabled: true
@@ -91,11 +94,13 @@ connections:
       dataset: "{dataset}"
       location: "US"
       storage_write_enabled: true
+      batch_load_bucket:
+      batch_load_prefix:
       emulator_http: "{bq_http}"
       emulator_grpc: "{bq_grpc}"
 "#,
-            state_path = state_path.display(),
-            stats_path = stats_path.display(),
+            state_schema = state_schema,
+            stats_schema = stats_schema,
         ),
     )
     .await?;
@@ -108,7 +113,11 @@ connections:
         .context("runner did not exit in time")??;
     assert!(status.success());
 
-    let state = SyncState::load(&state_path).await?;
+    let state = SyncState::load_with_config(&StateConfig {
+        url: pg_url.clone(),
+        schema: Some(state_schema.clone()),
+    })
+    .await?;
     let connection = state
         .connections
         .get("runner_demo")
@@ -166,15 +175,16 @@ async fn e2e_runner_cdc_graceful_shutdown() -> Result<()> {
     .await?;
 
     let temp_dir = tempfile::tempdir()?;
-    let state_path = temp_dir.path().join("state.db");
-    let stats_path = temp_dir.path().join("stats.db");
+    let state_schema = format!("cdsync_state_runner_cdc_{}", &suffix[..8]);
+    let stats_schema = format!("cdsync_stats_runner_cdc_{}", &suffix[..8]);
     let config_path = temp_dir.path().join("config.yaml");
     tokio::fs::write(
         &config_path,
         format!(
             r#"
 state:
-  path: "{state_path}"
+  url: "{pg_url}"
+  schema: "{state_schema}"
 logging:
   level: "info"
   json: false
@@ -186,7 +196,8 @@ sync:
   retry_backoff_ms: 1000
   max_concurrency: 1
 stats:
-  path: "{stats_path}"
+  url: "{pg_url}"
+  schema: "{stats_schema}"
 connections:
   - id: "runner_cdc_demo"
     enabled: true
@@ -208,11 +219,13 @@ connections:
       dataset: "{dataset}"
       location: "US"
       storage_write_enabled: true
+      batch_load_bucket:
+      batch_load_prefix:
       emulator_http: "{bq_http}"
       emulator_grpc: "{bq_grpc}"
 "#,
-            state_path = state_path.display(),
-            stats_path = stats_path.display(),
+            state_schema = state_schema,
+            stats_schema = stats_schema,
         ),
     )
     .await?;
@@ -225,7 +238,11 @@ connections:
         .context("runner did not exit in time")??;
     assert!(status.success());
 
-    let state = SyncState::load(&state_path).await?;
+    let state = SyncState::load_with_config(&StateConfig {
+        url: pg_url.clone(),
+        schema: Some(state_schema.clone()),
+    })
+    .await?;
     let connection = state
         .connections
         .get("runner_cdc_demo")

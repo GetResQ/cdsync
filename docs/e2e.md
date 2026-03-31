@@ -179,7 +179,8 @@ connections:
       storage_write_enabled: true
 
 state:
-  path: ./state.db
+  url: postgres://user:pass@host:5432/db
+  schema: cdsync_state
 ```
 
 ### 4) Validate + run

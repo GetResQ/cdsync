@@ -97,6 +97,8 @@ async fn e2e_cdc_soft_delete_sets_deleted_at() -> Result<()> {
         service_account_key: None,
         partition_by_synced_at: Some(false),
         storage_write_enabled: Some(true),
+        batch_load_bucket: None,
+        batch_load_prefix: None,
         emulator_http: Some(bq_http.clone()),
         emulator_grpc: Some(bq_grpc.clone()),
     };
@@ -127,6 +129,7 @@ async fn e2e_cdc_soft_delete_sets_deleted_at() -> Result<()> {
             dry_run: false,
             follow: false,
             default_batch_size: 1000,
+            snapshot_concurrency: 1,
             tables: &tables,
             schema_diff_enabled: false,
             stats: None,
@@ -147,6 +150,7 @@ async fn e2e_cdc_soft_delete_sets_deleted_at() -> Result<()> {
             dry_run: false,
             follow: false,
             default_batch_size: 1000,
+            snapshot_concurrency: 1,
             tables: &tables,
             schema_diff_enabled: false,
             stats: None,
@@ -260,6 +264,8 @@ async fn e2e_polling_soft_delete_sets_deleted_at() -> Result<()> {
         service_account_key: None,
         partition_by_synced_at: Some(false),
         storage_write_enabled: Some(true),
+        batch_load_bucket: None,
+        batch_load_prefix: None,
         emulator_http: Some(bq_http.clone()),
         emulator_grpc: Some(bq_grpc.clone()),
     };

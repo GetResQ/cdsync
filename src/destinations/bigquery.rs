@@ -1,5 +1,6 @@
 use crate::config::BigQueryConfig;
 use crate::destinations::{Destination, WriteMode, with_metadata_schema};
+use crate::tls;
 use crate::types::{ColumnSchema, DataType, MetadataColumns, TableSchema};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -9,9 +10,16 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use gcloud_bigquery::client::google_cloud_auth::credentials::CredentialsFile;
+use gcloud_bigquery::client::google_cloud_auth::project::Config as GoogleAuthConfig;
+use gcloud_bigquery::client::google_cloud_auth::token::DefaultTokenSourceProvider;
 use gcloud_bigquery::client::{Client, ClientConfig};
 use gcloud_bigquery::http::error::Error as BqError;
+use gcloud_bigquery::http::job::get::GetJobRequest;
 use gcloud_bigquery::http::job::query::{QueryRequest, QueryResponse};
+use gcloud_bigquery::http::job::{
+    CreateDisposition, Job, JobConfiguration, JobConfigurationLoad, JobReference, JobState,
+    JobType, WriteDisposition,
+};
 use gcloud_bigquery::http::table::{
     Table, TableFieldSchema, TableFieldType, TableReference, TableSchema as BqTableSchema,
     TimePartitionType, TimePartitioning,
@@ -33,14 +41,19 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
+use token_source::{TokenSource, TokenSourceProvider};
 use tokio::sync::Mutex;
+use tokio::time::sleep;
 use tonic::Code;
 use tracing::{error, info, warn};
 use url::Url;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct BigQueryDestination {
     client: Client,
+    gcs_token_source: Option<Arc<dyn TokenSource>>,
     config: BigQueryConfig,
     dry_run: bool,
     metadata: MetadataColumns,
@@ -68,11 +81,14 @@ impl BigQueryDestination {
         dry_run: bool,
         metadata: MetadataColumns,
     ) -> Result<Self> {
+        tls::install_rustls_provider();
         if config.emulator_http.is_none() && config.emulator_grpc.is_some() {
             anyhow::bail!("bigquery.emulator_grpc requires emulator_http");
         }
 
-        let (client_config, _project_from_auth) = if let Some(raw_http) = &config.emulator_http {
+        let (client_config, gcs_token_source, _project_from_auth) = if let Some(raw_http) =
+            &config.emulator_http
+        {
             let emulator_http = if raw_http.contains("://") {
                 raw_http.to_string()
             } else {
@@ -106,19 +122,41 @@ impl BigQueryDestination {
             (
                 ClientConfig::new_with_emulator(&emulator_grpc, emulator_http),
                 None,
+                None,
             )
         } else if let Some(path) = &config.service_account_key_path {
             let key = CredentialsFile::new_from_file(path.to_string_lossy().to_string()).await?;
-            ClientConfig::new_with_credentials(key).await?
+            let (bq_config, project) = ClientConfig::new_with_credentials(key.clone()).await?;
+            let token_source = DefaultTokenSourceProvider::new_with_credentials(
+                GoogleAuthConfig::default()
+                    .with_scopes(&["https://www.googleapis.com/auth/devstorage.read_write"]),
+                Box::new(key),
+            )
+            .await?;
+            (bq_config, Some(token_source.token_source()), project)
         } else if let Some(raw_key) = &config.service_account_key {
             let key = CredentialsFile::new_from_str(raw_key).await?;
-            ClientConfig::new_with_credentials(key).await?
+            let (bq_config, project) = ClientConfig::new_with_credentials(key).await?;
+            let token_source = DefaultTokenSourceProvider::new_with_credentials(
+                GoogleAuthConfig::default()
+                    .with_scopes(&["https://www.googleapis.com/auth/devstorage.read_write"]),
+                Box::new(CredentialsFile::new_from_str(raw_key).await?),
+            )
+            .await?;
+            (bq_config, Some(token_source.token_source()), project)
         } else {
-            ClientConfig::new_with_auth().await?
+            let (bq_config, project) = ClientConfig::new_with_auth().await?;
+            let token_source = DefaultTokenSourceProvider::new(
+                GoogleAuthConfig::default()
+                    .with_scopes(&["https://www.googleapis.com/auth/devstorage.read_write"]),
+            )
+            .await?;
+            (bq_config, Some(token_source.token_source()), project)
         };
         let client = Client::new(client_config).await?;
         Ok(Self {
             client,
+            gcs_token_source,
             config,
             dry_run,
             metadata,
@@ -145,6 +183,10 @@ impl BigQueryDestination {
             Err(BqError::Response(err)) if err.code == 404 => Ok(()),
             Err(err) => Err(err.into()),
         }
+    }
+
+    fn batch_load_enabled(&self) -> bool {
+        self.config.batch_load_bucket.is_some() && self.config.emulator_http.is_none()
     }
 
     pub async fn summarize_table(&self, table_id: &str) -> Result<DestinationTableSummary> {
@@ -524,6 +566,12 @@ impl BigQueryDestination {
             return Ok(());
         }
         if self
+            .append_rows_via_batch_load(table_id, schema, frame)
+            .await?
+        {
+            return Ok(());
+        }
+        if self
             .append_rows_via_storage_write(table_id, schema, frame)
             .await?
         {
@@ -650,6 +698,153 @@ impl BigQueryDestination {
         })?;
         Ok(())
     }
+
+    async fn append_rows_via_batch_load(
+        &self,
+        table_id: &str,
+        schema: &TableSchema,
+        frame: &DataFrame,
+    ) -> Result<bool> {
+        if !self.batch_load_enabled() {
+            return Ok(false);
+        }
+
+        let bucket = match &self.config.batch_load_bucket {
+            Some(bucket) => bucket,
+            None => return Ok(false),
+        };
+        let token_source = match &self.gcs_token_source {
+            Some(token_source) => token_source,
+            None => anyhow::bail!("GCS batch load requested but token source is unavailable"),
+        };
+
+        let object_name =
+            batch_load_object_name(self.config.batch_load_prefix.as_deref(), table_id, "ndjson");
+        let object_uri = format!("gs://{}/{}", bucket, object_name);
+        let body = dataframe_to_ndjson_bytes(frame)?;
+        self.upload_batch_load_object(token_source, bucket, &object_name, body)
+            .await
+            .with_context(|| format!("uploading batch load object {}", object_uri))?;
+
+        self.run_load_job(table_id, schema, &object_uri).await?;
+        Ok(true)
+    }
+
+    async fn upload_batch_load_object(
+        &self,
+        token_source: &Arc<dyn TokenSource>,
+        bucket: &str,
+        object_name: &str,
+        body: Vec<u8>,
+    ) -> Result<()> {
+        let token = token_source
+            .token()
+            .await
+            .map_err(|err| anyhow::anyhow!("fetching GCS access token failed: {}", err))?;
+        let url = format!(
+            "https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=media&name={}",
+            bucket,
+            urlencoding::encode(object_name)
+        );
+        let response = reqwest::Client::new()
+            .post(url)
+            .header("Authorization", token)
+            .header("Content-Type", "application/x-ndjson")
+            .body(body)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("GCS upload failed: {} {}", status, body);
+        }
+        Ok(())
+    }
+
+    async fn run_load_job(
+        &self,
+        table_id: &str,
+        schema: &TableSchema,
+        source_uri: &str,
+    ) -> Result<()> {
+        let schema = with_metadata_schema(schema, &self.metadata);
+        let job_id = format!("cdsync_load_{}", Uuid::new_v4().simple());
+        let location = self.config.location.clone();
+        let job = Job {
+            job_reference: JobReference {
+                project_id: self.config.project_id.clone(),
+                job_id: job_id.clone(),
+                location: location.clone(),
+            },
+            configuration: JobConfiguration {
+                job_type: "LOAD".to_string(),
+                job: JobType::Load(JobConfigurationLoad {
+                    source_uris: vec![source_uri.to_string()],
+                    schema: Some(BqTableSchema {
+                        fields: bq_fields_from_schema(&schema.columns),
+                    }),
+                    destination_table: TableReference {
+                        project_id: self.config.project_id.clone(),
+                        dataset_id: self.config.dataset.clone(),
+                        table_id: table_id.to_string(),
+                    },
+                    create_disposition: Some(CreateDisposition::CreateIfNeeded),
+                    write_disposition: Some(WriteDisposition::WriteAppend),
+                    source_format: Some(
+                        gcloud_bigquery::http::table::SourceFormat::NewlineDelimitedJson,
+                    ),
+                    max_bad_records: Some(0),
+                    autodetect: Some(false),
+                    ignore_unknown_values: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let created = self
+            .client
+            .job()
+            .create(&job)
+            .await
+            .with_context(|| format!("creating BigQuery load job for {}", source_uri))?;
+
+        self.wait_for_job_completion(&created).await
+    }
+
+    async fn wait_for_job_completion(&self, job: &Job) -> Result<()> {
+        let job_id = &job.job_reference.job_id;
+        let location = job.job_reference.location.clone();
+        loop {
+            let current = self
+                .client
+                .job()
+                .get(
+                    &self.config.project_id,
+                    job_id,
+                    &GetJobRequest {
+                        location: location.clone(),
+                    },
+                )
+                .await
+                .with_context(|| format!("fetching BigQuery job {}", job_id))?;
+
+            if current.status.state == JobState::Done {
+                if let Some(error_result) = current.status.error_result {
+                    anyhow::bail!("BigQuery load job {} failed: {:?}", job_id, error_result);
+                }
+                if let Some(errors) = current.status.errors
+                    && !errors.is_empty()
+                {
+                    anyhow::bail!("BigQuery load job {} reported errors: {:?}", job_id, errors);
+                }
+                return Ok(());
+            }
+
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
 }
 
 #[async_trait]
@@ -748,11 +943,11 @@ fn bq_fields_from_schema(columns: &[ColumnSchema]) -> Vec<TableFieldSchema> {
             TableFieldSchema {
                 name: col.name.clone(),
                 data_type,
-                mode: if col.nullable {
-                    Some(gcloud_bigquery::http::table::TableFieldMode::Nullable)
-                } else {
-                    Some(gcloud_bigquery::http::table::TableFieldMode::Required)
-                },
+                // Replication batches may legitimately contain NULLs for fields that are
+                // declared NOT NULL at the source, for example during CDC updates that omit
+                // unchanged toasted columns. Keeping destination fields nullable avoids
+                // load-job failures while preserving data values and metadata.
+                mode: Some(gcloud_bigquery::http::table::TableFieldMode::Nullable),
                 ..Default::default()
             }
         })
@@ -762,6 +957,29 @@ fn bq_fields_from_schema(columns: &[ColumnSchema]) -> Vec<TableFieldSchema> {
 fn bq_ident(name: &str) -> String {
     let escaped = name.replace('`', "\\`");
     format!("`{}`", escaped)
+}
+
+fn batch_load_object_name(prefix: Option<&str>, table_id: &str, extension: &str) -> String {
+    let base = format!(
+        "{}_{}.{}",
+        table_id.replace('.', "_"),
+        Uuid::new_v4().simple(),
+        extension
+    );
+    match prefix.map(str::trim).filter(|prefix| !prefix.is_empty()) {
+        Some(prefix) => format!("{}/{}", prefix.trim_end_matches('/'), base),
+        None => base,
+    }
+}
+
+fn dataframe_to_ndjson_bytes(frame: &DataFrame) -> Result<Vec<u8>> {
+    let rows = dataframe_to_json_rows(frame)?;
+    let mut out = Vec::new();
+    for row in rows {
+        serde_json::to_writer(&mut out, &row)?;
+        out.push(b'\n');
+    }
+    Ok(out)
 }
 
 fn supports_storage_write_schema(schema: &TableSchema) -> bool {
@@ -1189,6 +1407,14 @@ mod storage_write_tests {
     }
 
     #[test]
+    fn bigquery_fields_are_always_nullable_for_replication() {
+        let fields = bq_fields_from_schema(&schema().columns);
+        assert!(fields.iter().all(|field| {
+            field.mode == Some(gcloud_bigquery::http::table::TableFieldMode::Nullable)
+        }));
+    }
+
+    #[test]
     fn storage_write_descriptor_round_trip_encodes_rows() {
         let schema = schema();
         let descriptor = build_storage_write_descriptor(&schema);
@@ -1261,5 +1487,31 @@ mod storage_write_tests {
             .expect("postgres timestamptz");
         let dt = DateTime::<Utc>::from_timestamp_micros(micros).expect("valid micros");
         assert_eq!(dt.to_rfc3339(), "2026-03-30T01:36:12.186373+00:00");
+    }
+
+    #[test]
+    fn batch_load_object_name_uses_prefix_when_present() {
+        let name = batch_load_object_name(Some("staging/app"), "public__items", "ndjson");
+        assert!(name.starts_with("staging/app/public__items_"));
+        assert!(name.ends_with(".ndjson"));
+    }
+
+    #[test]
+    fn dataframe_to_ndjson_bytes_emits_one_json_object_per_line() {
+        let frame = DataFrame::new(vec![
+            polars::prelude::Series::new("id".into(), &[1_i64, 2_i64]).into(),
+            polars::prelude::Series::new("name".into(), &["alpha", "beta"]).into(),
+        ])
+        .expect("frame");
+
+        let payload = dataframe_to_ndjson_bytes(&frame).expect("ndjson bytes");
+        let text = String::from_utf8(payload).expect("utf8");
+        let lines: Vec<&str> = text.lines().collect();
+
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"id\":1"));
+        assert!(lines[0].contains("\"name\":\"alpha\""));
+        assert!(lines[1].contains("\"id\":2"));
+        assert!(lines[1].contains("\"name\":\"beta\""));
     }
 }

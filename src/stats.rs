@@ -1,14 +1,14 @@
+use crate::config::StatsConfig;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::migrate::Migrator;
+use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::collections::HashMap;
-use std::path::Path;
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+static STATS_MIGRATOR: Migrator = sqlx::migrate!("./migrations/stats");
 
 #[derive(Clone)]
 pub struct StatsHandle {
@@ -212,94 +212,64 @@ impl StatsHandle {
     }
 }
 
+#[derive(Clone)]
 pub struct StatsDb {
-    pool: SqlitePool,
+    pool: PgPool,
+    schema: String,
 }
 
 impl StatsDb {
-    pub async fn new(path: &Path) -> anyhow::Result<Self> {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
-            .create_if_missing(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(options)
-            .await?;
-        let db = Self { pool };
+    pub async fn migrate_with_config(config: &StatsConfig, default_url: &str) -> anyhow::Result<()> {
+        let url = config.url.as_deref().unwrap_or(default_url);
+        let schema = config.schema_name().to_string();
+        validate_schema_name(&schema)?;
+        let pool = PgPoolOptions::new().max_connections(5).connect(url).await?;
+        let db = Self { pool, schema };
+        db.migrate().await
+    }
+
+    pub async fn new(config: &StatsConfig, default_url: &str) -> anyhow::Result<Self> {
+        let url = config.url.as_deref().unwrap_or(default_url);
+        let schema = config.schema_name().to_string();
+        validate_schema_name(&schema)?;
+        let pool = PgPoolOptions::new().max_connections(5).connect(url).await?;
+        let db = Self { pool, schema };
         db.init().await?;
         Ok(db)
     }
 
     async fn init(&self) -> anyhow::Result<()> {
-        sqlx::query(
-            r#"
-            create table if not exists runs (
-                run_id text primary key,
-                connection_id text not null,
-                started_at text not null,
-                finished_at text,
-                status text,
-                error text,
-                rows_read integer not null,
-                rows_written integer not null,
-                rows_deleted integer not null,
-                rows_upserted integer not null,
-                extract_ms integer not null,
-                load_ms integer not null,
-                api_calls integer not null,
-                rate_limit_hits integer not null
-            );
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
+        let mut conn = self.pool.acquire().await?;
+        ensure_schema_exists(&mut conn, &self.schema).await?;
+        ensure_table_exists(&mut conn, &self.schema, "_sqlx_migrations").await?;
+        ensure_table_exists(&mut conn, &self.schema, "runs").await?;
+        ensure_table_exists(&mut conn, &self.schema, "run_tables").await?;
+        Ok(())
+    }
 
-        sqlx::query(
-            r#"
-            create table if not exists run_tables (
-                id integer primary key autoincrement,
-                run_id text not null,
-                connection_id text not null,
-                table_name text not null,
-                rows_read integer not null,
-                rows_written integer not null,
-                rows_deleted integer not null,
-                rows_upserted integer not null,
-                extract_ms integer not null,
-                load_ms integer not null
-            );
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query("create index if not exists idx_runs_connection on runs(connection_id);")
-            .execute(&self.pool)
+    async fn migrate(&self) -> anyhow::Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        create_schema_if_missing(&mut conn, &self.schema).await?;
+        sqlx::query(&format!("set search_path to {}", quote_ident(&self.schema)))
+            .execute(&mut *conn)
             .await?;
-        sqlx::query(
-            "create index if not exists idx_run_tables_connection on run_tables(connection_id);",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query("create index if not exists idx_run_tables_table on run_tables(table_name);")
-            .execute(&self.pool)
-            .await?;
-
+        STATS_MIGRATOR.run_direct(&mut *conn).await?;
         Ok(())
     }
 
     pub async fn persist_run(&self, handle: &StatsHandle) -> anyhow::Result<()> {
         let snapshot = handle.snapshot().await;
-        sqlx::query("delete from run_tables where run_id = ?")
-            .bind(&snapshot.run_id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(&format!(
+            "delete from {} where run_id = $1",
+            self.table("run_tables")
+        ))
+        .bind(&snapshot.run_id)
+        .execute(&self.pool)
+        .await?;
 
-        sqlx::query(
+        sqlx::query(&format!(
             r#"
-            insert or replace into runs (
+            insert into {} (
                 run_id,
                 connection_id,
                 started_at,
@@ -314,9 +284,24 @@ impl StatsDb {
                 load_ms,
                 api_calls,
                 rate_limit_hits
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            on conflict(run_id) do update set
+                connection_id = excluded.connection_id,
+                started_at = excluded.started_at,
+                finished_at = excluded.finished_at,
+                status = excluded.status,
+                error = excluded.error,
+                rows_read = excluded.rows_read,
+                rows_written = excluded.rows_written,
+                rows_deleted = excluded.rows_deleted,
+                rows_upserted = excluded.rows_upserted,
+                extract_ms = excluded.extract_ms,
+                load_ms = excluded.load_ms,
+                api_calls = excluded.api_calls,
+                rate_limit_hits = excluded.rate_limit_hits
             "#,
-        )
+            self.table("runs")
+        ))
         .bind(&snapshot.run_id)
         .bind(&snapshot.connection_id)
         .bind(snapshot.started_at.to_rfc3339())
@@ -335,9 +320,9 @@ impl StatsDb {
         .await?;
 
         for table in snapshot.tables {
-            sqlx::query(
+            sqlx::query(&format!(
                 r#"
-                insert into run_tables (
+                insert into {} (
                     run_id,
                     connection_id,
                     table_name,
@@ -347,9 +332,10 @@ impl StatsDb {
                     rows_upserted,
                     extract_ms,
                     load_ms
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 "#,
-            )
+                self.table("run_tables")
+            ))
             .bind(&table.run_id)
             .bind(&table.connection_id)
             .bind(&table.table_name)
@@ -373,7 +359,7 @@ impl StatsDb {
     ) -> anyhow::Result<Vec<RunSummary>> {
         let limit = limit.max(1) as i64;
         let rows = if let Some(connection_id) = connection_id {
-            sqlx::query(
+            sqlx::query(&format!(
                 r#"
                 select
                     run_id,
@@ -390,18 +376,19 @@ impl StatsDb {
                     load_ms,
                     api_calls,
                     rate_limit_hits
-                from runs
-                where connection_id = ?
+                from {}
+                where connection_id = $1
                 order by started_at desc
-                limit ?
+                limit $2
                 "#,
-            )
+                self.table("runs")
+            ))
             .bind(connection_id)
             .bind(limit)
             .fetch_all(&self.pool)
             .await?
         } else {
-            sqlx::query(
+            sqlx::query(&format!(
                 r#"
                 select
                     run_id,
@@ -418,11 +405,12 @@ impl StatsDb {
                     load_ms,
                     api_calls,
                     rate_limit_hits
-                from runs
+                from {}
                 order by started_at desc
-                limit ?
+                limit $1
                 "#,
-            )
+                self.table("runs")
+            ))
             .bind(limit)
             .fetch_all(&self.pool)
             .await?
@@ -452,6 +440,87 @@ impl StatsDb {
             })
             .collect()
     }
+
+    pub async fn ping(&self) -> anyhow::Result<()> {
+        let _: i64 = sqlx::query_scalar("select 1").fetch_one(&self.pool).await?;
+        Ok(())
+    }
+
+    fn table(&self, table_name: &str) -> String {
+        format!("{}.{}", quote_ident(&self.schema), quote_ident(table_name))
+    }
+}
+
+fn validate_schema_name(schema: &str) -> anyhow::Result<()> {
+    let mut chars = schema.chars();
+    match chars.next() {
+        Some(ch) if ch.is_ascii_alphabetic() || ch == '_' => {}
+        _ => anyhow::bail!("invalid postgres stats schema `{}`", schema),
+    }
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        anyhow::bail!("invalid postgres stats schema `{}`", schema);
+    }
+    Ok(())
+}
+
+fn quote_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+async fn ensure_schema_exists(conn: &mut sqlx::PgConnection, schema: &str) -> anyhow::Result<()> {
+    let exists: bool =
+        sqlx::query_scalar("select exists (select 1 from pg_namespace where nspname = $1)")
+            .bind(schema)
+            .fetch_one(&mut *conn)
+            .await?;
+    if !exists {
+        anyhow::bail!("required schema {} does not exist", schema);
+    }
+    Ok(())
+}
+
+async fn create_schema_if_missing(
+    conn: &mut sqlx::PgConnection,
+    schema: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(&format!(
+        "create schema if not exists {}",
+        quote_ident(schema)
+    ))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+async fn ensure_table_exists(
+    conn: &mut sqlx::PgConnection,
+    schema: &str,
+    table: &str,
+) -> anyhow::Result<()> {
+    let exists: bool = sqlx::query_scalar(
+        r#"
+        select exists (
+            select 1
+            from pg_class c
+            join pg_namespace n on n.oid = c.relnamespace
+            where n.nspname = $1
+              and c.relname = $2
+              and c.relkind in ('r', 'p')
+        )
+        "#,
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_one(&mut *conn)
+    .await?;
+    if !exists {
+        anyhow::bail!(
+            "required table {}.{} does not exist; run `cdsync migrate --config ...` first",
+            schema,
+            table
+        );
+    }
+    Ok(())
 }
 
 fn parse_rfc3339(value: String) -> anyhow::Result<DateTime<Utc>> {

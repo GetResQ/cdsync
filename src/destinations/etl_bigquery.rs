@@ -9,12 +9,13 @@ use chrono::{DateTime, NaiveTime, TimeZone, Utc};
 use etl::destination::Destination as EtlDestination;
 use etl::error::{ErrorKind, EtlError, EtlResult};
 use etl::types::{Cell, Event, TableId, TableRow};
+use futures::stream::{FuturesUnordered, StreamExt};
 use polars::frame::row::Row as PolarsRow;
 use polars::prelude::{AnyValue, DataFrame, DataType as PolarsDataType, Field, PlSmallStr, Schema};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tracing::warn;
 
 #[derive(Clone)]
@@ -22,6 +23,7 @@ pub struct EtlBigQueryDestination {
     inner: BigQueryDestination,
     tables: Arc<RwLock<HashMap<TableId, CdcTableInfo>>>,
     stats: Option<StatsHandle>,
+    apply_concurrency: usize,
 }
 
 #[derive(Clone)]
@@ -47,6 +49,13 @@ pub struct CdcTableSpec {
     pub primary_key: String,
     pub soft_delete: bool,
     pub soft_delete_column: Option<String>,
+}
+
+struct CdcCommitTableWork {
+    table_id: TableId,
+    rows: Vec<TableRow>,
+    delete_rows: Vec<TableRow>,
+    truncate: bool,
 }
 
 impl CdcTableInfo {
@@ -100,11 +109,13 @@ impl EtlBigQueryDestination {
         inner: BigQueryDestination,
         tables: HashMap<TableId, CdcTableInfo>,
         stats: Option<StatsHandle>,
+        apply_concurrency: usize,
     ) -> Self {
         Self {
             inner,
             tables: Arc::new(RwLock::new(tables)),
             stats,
+            apply_concurrency: apply_concurrency.max(1),
         }
     }
 
@@ -197,6 +208,43 @@ impl EtlBigQueryDestination {
         Ok(())
     }
 
+    async fn flush_table_work(
+        &self,
+        work: CdcCommitTableWork,
+        synced_at: DateTime<Utc>,
+        delete_synced_at: DateTime<Utc>,
+    ) -> EtlResult<()> {
+        let info = self.get_table(work.table_id).await?;
+
+        if work.truncate
+            && let Err(err) = self.inner.truncate_table(&info.dest_name).await
+        {
+            return Err(etl::etl_error!(
+                ErrorKind::DestinationError,
+                "failed to truncate table from CDC event",
+                err.to_string()
+            ));
+        }
+
+        if !work.rows.is_empty() {
+            self.write_rows(&info, &work.rows, WriteMode::Upsert, synced_at, None)
+                .await?;
+        }
+
+        if !work.delete_rows.is_empty() {
+            self.write_rows(
+                &info,
+                &work.delete_rows,
+                WriteMode::Upsert,
+                delete_synced_at,
+                Some(delete_synced_at),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
     async fn flush_pending(
         &self,
         pending: &mut HashMap<TableId, Vec<TableRow>>,
@@ -205,35 +253,64 @@ impl EtlBigQueryDestination {
     ) -> EtlResult<()> {
         let synced_at = Utc::now();
         let delete_synced_at = synced_at;
+        let mut work_by_table: HashMap<TableId, CdcCommitTableWork> = HashMap::new();
 
         for table_id in truncate_tables.drain(..) {
-            if let Ok(info) = self.get_table(table_id).await
-                && let Err(err) = self.inner.truncate_table(&info.dest_name).await
-            {
-                return Err(etl::etl_error!(
-                    ErrorKind::DestinationError,
-                    "failed to truncate table from CDC event",
-                    err.to_string()
-                ));
-            }
+            work_by_table
+                .entry(table_id)
+                .or_insert_with(|| CdcCommitTableWork {
+                    table_id,
+                    rows: Vec::new(),
+                    delete_rows: Vec::new(),
+                    truncate: false,
+                })
+                .truncate = true;
         }
 
         for (table_id, rows) in pending.drain() {
-            let info = self.get_table(table_id).await?;
-            self.write_rows(&info, &rows, WriteMode::Upsert, synced_at, None)
-                .await?;
+            work_by_table
+                .entry(table_id)
+                .or_insert_with(|| CdcCommitTableWork {
+                    table_id,
+                    rows: Vec::new(),
+                    delete_rows: Vec::new(),
+                    truncate: false,
+                })
+                .rows = rows;
         }
 
         for (table_id, rows) in pending_deletes.drain() {
-            let info = self.get_table(table_id).await?;
-            self.write_rows(
-                &info,
-                &rows,
-                WriteMode::Upsert,
-                delete_synced_at,
-                Some(delete_synced_at),
-            )
-            .await?;
+            work_by_table
+                .entry(table_id)
+                .or_insert_with(|| CdcCommitTableWork {
+                    table_id,
+                    rows: Vec::new(),
+                    delete_rows: Vec::new(),
+                    truncate: false,
+                })
+                .delete_rows = rows;
+        }
+
+        let semaphore = Arc::new(Semaphore::new(self.apply_concurrency));
+        let mut tasks = FuturesUnordered::new();
+        for work in work_by_table.into_values() {
+            let permit_pool = Arc::clone(&semaphore);
+            let dest = self.clone();
+            tasks.push(async move {
+                let permit = permit_pool.acquire_owned().await.map_err(|_| {
+                    etl::etl_error!(
+                        ErrorKind::DestinationError,
+                        "failed to acquire CDC apply concurrency permit"
+                    )
+                })?;
+                let _permit = permit;
+                dest.flush_table_work(work, synced_at, delete_synced_at)
+                    .await
+            });
+        }
+
+        while let Some(result) = tasks.next().await {
+            result?;
         }
 
         Ok(())

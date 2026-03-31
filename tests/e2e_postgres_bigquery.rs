@@ -88,6 +88,8 @@ async fn e2e_postgres_bigquery_full_refresh() -> Result<()> {
         service_account_key: None,
         partition_by_synced_at: Some(false),
         storage_write_enabled: Some(true),
+        batch_load_bucket: None,
+        batch_load_prefix: None,
         emulator_http: Some(bq_http.clone()),
         emulator_grpc: Some(bq_grpc.clone()),
     };
@@ -237,6 +239,8 @@ async fn e2e_postgres_bigquery_custom_metadata_columns() -> Result<()> {
         service_account_key: None,
         partition_by_synced_at: Some(false),
         storage_write_enabled: Some(true),
+        batch_load_bucket: None,
+        batch_load_prefix: None,
         emulator_http: Some(bq_http.clone()),
         emulator_grpc: Some(bq_grpc.clone()),
     };

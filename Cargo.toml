@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 async-trait = "0.1"
 anyhow = "1"
+axum = { version = "0.8.8", features = ["json", "tokio", "http1"] }
 base64 = "0.22"
 bigdecimal = "0.4"
 bytes = "1"
@@ -29,16 +30,20 @@ postgres-replication = { git = "https://github.com/MaterializeInc/rust-postgres"
 prost = "0.14"
 prost-reflect = "0.16"
 prost-types = "0.14"
+native-tls = "0.2"
 reqwest = { version = "0.12", features = ["json"] }
 rustls = { version = "0.23", features = ["ring"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "sqlite", "chrono", "uuid", "json", "bigdecimal"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json", "bigdecimal"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "process"] }
+tokio-native-tls = "0.3"
+tokio-postgres = { git = "https://github.com/MaterializeInc/rust-postgres", rev = "c4b473b478b3adfbf8667d2fbe895d8423f1290b" }
 toml = "0.8"
 tonic = "0.14"
+token-source = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json", "time"] }
 tracing-opentelemetry = "0.32.1"

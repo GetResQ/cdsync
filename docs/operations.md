@@ -1,5 +1,10 @@
 # Operations
 
+See also: [phased-migration-plan.md](/Users/mazdak/Code/cdsync/docs/phased-migration-plan.md)
+See also: [staging-oneoff-ecs.md](/Users/mazdak/Code/cdsync/docs/staging-oneoff-ecs.md)
+See also: [how-cdsync-works.md](/Users/mazdak/Code/cdsync/docs/how-cdsync-works.md)
+See also: [config-reload-plan.md](/Users/mazdak/Code/cdsync/docs/config-reload-plan.md)
+
 ## Runner Mode
 
 Use `run` when you want CDSync to stay alive under a process manager instead of invoking one-shot `sync`.

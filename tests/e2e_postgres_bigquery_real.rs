@@ -91,6 +91,8 @@ async fn e2e_postgres_bigquery_real_heavy_sync() -> Result<()> {
         service_account_key: None,
         partition_by_synced_at: Some(false),
         storage_write_enabled: Some(true),
+        batch_load_bucket: None,
+        batch_load_prefix: None,
         emulator_http: None,
         emulator_grpc: None,
     };

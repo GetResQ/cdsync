@@ -1,11 +1,23 @@
+use cdsync::config::StateConfig;
 use cdsync::state::{ConnectionState, PostgresCdcState, SyncStateStore};
 use cdsync::types::TableCheckpoint;
+use uuid::Uuid;
+
+fn test_state_config() -> Option<StateConfig> {
+    let url = std::env::var("CDSYNC_E2E_PG_URL").ok()?;
+    Some(StateConfig {
+        url,
+        schema: Some(format!("cdsync_state_it_{}", Uuid::new_v4().simple())),
+    })
+}
 
 #[tokio::test]
-async fn sqlite_state_store_persists_public_api_state() -> anyhow::Result<()> {
-    let temp_dir = tempfile::tempdir()?;
-    let path = temp_dir.path().join("state.db");
-    let store = SyncStateStore::open(&path).await?;
+async fn postgres_state_store_persists_public_api_state() -> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config).await?;
+    let store = SyncStateStore::open_with_config(&config).await?;
     let handle = store.handle("app");
 
     let mut connection = ConnectionState {
@@ -49,10 +61,12 @@ async fn sqlite_state_store_persists_public_api_state() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn sqlite_state_store_releases_lock_for_next_owner() -> anyhow::Result<()> {
-    let temp_dir = tempfile::tempdir()?;
-    let path = temp_dir.path().join("state.db");
-    let store = SyncStateStore::open(&path).await?;
+async fn postgres_state_store_releases_lock_for_next_owner() -> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    SyncStateStore::migrate_with_config(&config).await?;
+    let store = SyncStateStore::open_with_config(&config).await?;
 
     let lease = store.acquire_connection_lock("app").await?;
     assert!(store.acquire_connection_lock("app").await.is_err());

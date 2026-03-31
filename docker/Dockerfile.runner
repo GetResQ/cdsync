@@ -5,6 +5,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tests ./tests
 COPY docs ./docs
+COPY deploy ./deploy
+COPY migrations ./migrations
 COPY .github ./github
 
 RUN cargo build --release
@@ -16,5 +18,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/cdsync /usr/local/bin/cdsync
+COPY deploy/ecs/cdsync-staging-oneoff.sh /opt/cdsync/cdsync-staging-oneoff.sh
+RUN chmod +x /opt/cdsync/cdsync-staging-oneoff.sh
 
 ENTRYPOINT ["cdsync", "run"]

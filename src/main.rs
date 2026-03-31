@@ -1,3 +1,4 @@
+mod admin_api;
 mod config;
 mod destinations;
 mod dotenv;
@@ -6,6 +7,7 @@ mod sources;
 mod state;
 mod stats;
 mod telemetry;
+mod tls;
 mod types;
 
 use crate::config::{Config, DestinationConfig, SourceConfig};
@@ -61,6 +63,10 @@ enum Commands {
         config: PathBuf,
         #[arg(long)]
         connection: String,
+    },
+    Migrate {
+        #[arg(long)]
+        config: PathBuf,
     },
     Status {
         #[arg(long)]
@@ -224,6 +230,7 @@ async fn load_latest_salesforce_checkpoint(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tls::install_rustls_provider();
     dotenv::load_dotenv()?;
     let cli = Cli::parse();
     match cli.command {
@@ -250,6 +257,7 @@ async fn main() -> Result<()> {
             .await
         }
         Commands::Run { config, connection } => cmd_run(config, connection).await,
+        Commands::Migrate { config } => cmd_migrate(config).await,
         Commands::Status { config, connection } => cmd_status(config, connection).await,
         Commands::Validate {
             config,
@@ -316,6 +324,21 @@ async fn cmd_init(config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_migrate(config_path: PathBuf) -> Result<()> {
+    let cfg = Config::load(&config_path).await?;
+    let _telemetry = telemetry::init(cfg.logging.as_ref(), cfg.observability.as_ref())?;
+    let stats_cfg = cfg.stats.clone().unwrap_or(crate::config::StatsConfig {
+        url: None,
+        schema: None,
+    });
+    SyncStateStore::migrate_with_config(&cfg.state).await?;
+    info!(schema = %cfg.state.schema_name(), "state migrations applied");
+    StatsDb::migrate_with_config(&stats_cfg, &cfg.state.url).await?;
+    info!(schema = %stats_cfg.schema_name(), "stats migrations applied");
+    println!("Migrations complete.");
+    Ok(())
+}
+
 async fn cmd_sync(request: SyncCommandRequest) -> Result<()> {
     let SyncCommandRequest {
         config_path,
@@ -335,7 +358,7 @@ async fn cmd_sync(request: SyncCommandRequest) -> Result<()> {
         anyhow::bail!("--follow requires --connection for a single postgres CDC connection");
     }
 
-    let state_store = SyncStateStore::open(&cfg.state.path).await?;
+    let state_store = SyncStateStore::open_with_config(&cfg.state).await?;
     let mode = match (full, incremental) {
         (true, false) => SyncMode::Full,
         (false, true) => SyncMode::Incremental,
@@ -347,7 +370,7 @@ async fn cmd_sync(request: SyncCommandRequest) -> Result<()> {
 
     let mut state = state_store.load_state().await?;
     let stats_db = if let Some(stats_cfg) = &cfg.stats {
-        Some(StatsDb::new(&stats_cfg.path).await?)
+        Some(StatsDb::new(stats_cfg, &cfg.state.url).await?)
     } else {
         None
     };
@@ -519,6 +542,7 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
                             dry_run,
                             follow,
                             default_batch_size,
+                            snapshot_concurrency: max_concurrency,
                             tables: &tables,
                             schema_diff_enabled,
                             stats: stats.clone(),
@@ -535,7 +559,7 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
                                 run_id = run_id.as_deref().unwrap_or("none"),
                                 attempt,
                                 backoff_ms = backoff.as_millis() as u64,
-                                error = %err,
+                                error = %format!("{err:#}"),
                                 "postgres CDC sync attempt failed; retrying"
                             );
                             if wait_backoff(backoff, shutdown.clone()).await {
@@ -555,7 +579,7 @@ async fn sync_connection(request: SyncConnectionRequest<'_>) -> Result<()> {
                                 connection = %connection.id,
                                 run_id = run_id.as_deref().unwrap_or("none"),
                                 attempt,
-                                error = %err,
+                                error = %format!("{err:#}"),
                                 "postgres CDC sync attempt failed permanently"
                             );
                             return Err(err);
@@ -835,6 +859,15 @@ async fn cmd_run(config_path: PathBuf, connection_id: String) -> Result<()> {
         signal_controller.shutdown();
     });
 
+    let mode = match (&connection.source, &connection.destination) {
+        (SourceConfig::Postgres(pg), DestinationConfig::BigQuery(_)) if pg.cdc.unwrap_or(true) => {
+            "cdc_follow"
+        }
+        _ => "scheduled_polling",
+    };
+    let admin_task =
+        admin_api::spawn_admin_api(&cfg, &connection.id, mode, shutdown_signal.clone()).await?;
+
     let result = match (&connection.source, &connection.destination) {
         (SourceConfig::Postgres(pg), DestinationConfig::BigQuery(_)) if pg.cdc.unwrap_or(true) => {
             cmd_sync(SyncCommandRequest {
@@ -875,13 +908,16 @@ async fn cmd_run(config_path: PathBuf, connection_id: String) -> Result<()> {
     };
     shutdown_controller.shutdown();
     signal_task.abort();
+    if let Some(task) = admin_task {
+        let _ = task.await;
+    }
     result
 }
 
 async fn cmd_status(config_path: PathBuf, connection: Option<String>) -> Result<()> {
     let cfg = Config::load(&config_path).await?;
     let _telemetry = telemetry::init(cfg.logging.as_ref(), cfg.observability.as_ref())?;
-    let state = SyncState::load(&cfg.state.path).await?;
+    let state = SyncState::load_with_config(&cfg.state).await?;
     if let Some(connection_id) = connection {
         let connection_state = state.connections.get(&connection_id);
         let output = serde_json::to_string_pretty(&connection_state)?;
@@ -947,7 +983,7 @@ async fn cmd_report(
 ) -> Result<()> {
     let cfg = Config::load(&config_path).await?;
     let _telemetry = telemetry::init(cfg.logging.as_ref(), cfg.observability.as_ref())?;
-    let state = SyncState::load(&cfg.state.path).await?;
+    let state = SyncState::load_with_config(&cfg.state).await?;
     let state_value = if let Some(connection_id) = &connection_filter {
         serde_json::to_value(state.connections.get(connection_id))?
     } else {
@@ -955,7 +991,7 @@ async fn cmd_report(
     };
 
     let recent_runs = if let Some(stats_cfg) = &cfg.stats {
-        StatsDb::new(&stats_cfg.path)
+        StatsDb::new(stats_cfg, &cfg.state.url)
             .await?
             .recent_runs(connection_filter.as_deref(), limit)
             .await?
@@ -1160,6 +1196,7 @@ mod reconcile_tests {
 #[cfg(test)]
 mod sync_selection_tests {
     use super::*;
+    use uuid::Uuid;
 
     fn postgres_connection(id: &str, enabled: Option<bool>) -> crate::config::ConnectionConfig {
         crate::config::ConnectionConfig {
@@ -1199,6 +1236,8 @@ mod sync_selection_tests {
                     service_account_key: None,
                     partition_by_synced_at: Some(false),
                     storage_write_enabled: Some(false),
+                    batch_load_bucket: None,
+                    batch_load_prefix: None,
                     emulator_http: Some("http://localhost:9050".to_string()),
                     emulator_grpc: Some("localhost:9051".to_string()),
                 },
@@ -1244,11 +1283,20 @@ mod sync_selection_tests {
         assert_eq!(ids, vec!["enabled", "default_enabled"]);
     }
 
+    fn test_state_config() -> Option<crate::config::StateConfig> {
+        let url = std::env::var("CDSYNC_E2E_PG_URL").ok()?;
+        Some(crate::config::StateConfig {
+            url,
+            schema: Some(format!("cdsync_state_test_{}", Uuid::new_v4().simple())),
+        })
+    }
+
     #[tokio::test]
     async fn load_latest_postgres_checkpoint_prefers_persisted_progress() -> anyhow::Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let path = temp_dir.path().join("state.db");
-        let store = SyncStateStore::open(&path).await?;
+        let Some(config) = test_state_config() else {
+            return Ok(());
+        };
+        let store = SyncStateStore::open_with_config(&config).await?;
         let handle = store.handle("app");
         let persisted = TableCheckpoint {
             last_primary_key: Some("42".to_string()),
@@ -1270,9 +1318,10 @@ mod sync_selection_tests {
 
     #[tokio::test]
     async fn load_latest_salesforce_checkpoint_prefers_persisted_progress() -> anyhow::Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let path = temp_dir.path().join("state.db");
-        let store = SyncStateStore::open(&path).await?;
+        let Some(config) = test_state_config() else {
+            return Ok(());
+        };
+        let store = SyncStateStore::open_with_config(&config).await?;
         let handle = store.handle("app");
         let persisted = TableCheckpoint {
             last_primary_key: Some("42".to_string()),

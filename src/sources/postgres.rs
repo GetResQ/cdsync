@@ -7,6 +7,7 @@ use crate::destinations::{Destination, WriteMode};
 use crate::runner::ShutdownSignal;
 use crate::state::{ConnectionState, StateHandle};
 use crate::stats::StatsHandle;
+use crate::tls::MakeNativeTlsConnect;
 use crate::types::{
     ColumnSchema, DataType, MetadataColumns, SchemaFieldSnapshot, TableCheckpoint, TableSchema,
 };
@@ -18,7 +19,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use etl::config::{PgConnectionConfig, TlsConfig};
 use etl::destination::Destination as EtlDestinationTrait;
 use etl::replication::client::PgReplicationClient;
-use etl::replication::stream::{EventsStream, StatusUpdateType, TableCopyStream};
+use etl::replication::stream::{EventsStream, StatusUpdateType};
 use etl::store::both::memory::MemoryStore;
 use etl::store::schema::SchemaStore;
 use etl::types::{
@@ -26,29 +27,63 @@ use etl::types::{
     TruncateEvent, UpdateEvent,
 };
 use etl_postgres::replication::slots::EtlReplicationSlot;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use globset::{Glob, GlobSet};
+use native_tls::Certificate;
 use polars::frame::row::Row as PolarsRow;
 use polars::prelude::{AnyValue, DataFrame, DataType as PolarsDataType, Field, PlSmallStr, Schema};
 use postgres_replication::protocol::{LogicalReplicationMessage, ReplicationMessage, TupleData};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::Row as SqlxRow;
 use sqlx::ValueRef;
+use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::hash::{Hash, Hasher};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tokio::time::timeout;
+use tokio_postgres::config::ReplicationMode;
+use tokio_postgres::{Client as TokioPgClient, NoTls, SimpleQueryMessage};
 use tracing::{info, warn};
 use url::Url;
 use uuid::Uuid;
+
+mod cdc_pipeline;
+mod convert;
+mod schema;
+mod table_selection;
+
+use self::cdc_pipeline::*;
+use self::convert::*;
+use self::schema::*;
+use self::table_selection::*;
+
+type CdcApplyFuture = Pin<Box<dyn Future<Output = Result<CdcApplyFragmentAck>> + Send>>;
 
 pub struct PostgresSource {
     config: PostgresConfig,
     metadata: MetadataColumns,
     pool: PgPool,
+}
+
+struct ExportedSnapshotSlot {
+    _client: TokioPgClient,
+}
+
+struct ExportedSnapshotSlotInfo {
+    consistent_point: String,
+    snapshot_name: String,
+}
+
+struct CdcSnapshotTask {
+    table: ResolvedPostgresTable,
+    info: CdcTableInfo,
 }
 
 const DEFAULT_PG_POOL_MAX: u32 = 5;
@@ -84,6 +119,7 @@ pub struct CdcSyncRequest<'a> {
     pub dry_run: bool,
     pub follow: bool,
     pub default_batch_size: usize,
+    pub snapshot_concurrency: usize,
     pub tables: &'a [ResolvedPostgresTable],
     pub schema_diff_enabled: bool,
     pub stats: Option<StatsHandle>,
@@ -115,6 +151,7 @@ struct CdcStreamConfig<'a> {
     pipeline_id: u64,
     idle_timeout: Duration,
     max_pending_events: usize,
+    apply_concurrency: usize,
     follow: bool,
     shutdown: Option<ShutdownSignal>,
 }
@@ -511,6 +548,7 @@ impl PostgresSource {
             dry_run,
             follow,
             default_batch_size,
+            snapshot_concurrency,
             tables,
             schema_diff_enabled,
             stats,
@@ -540,6 +578,7 @@ impl PostgresSource {
             .cdc_batch_size
             .or(self.config.batch_size)
             .unwrap_or(default_batch_size);
+        let snapshot_concurrency = snapshot_concurrency.max(1);
         let max_pending_events = self.config.cdc_max_pending_events.unwrap_or(100_000);
         let idle_timeout = Duration::from_secs(self.config.cdc_idle_timeout_seconds.unwrap_or(10));
 
@@ -610,8 +649,12 @@ impl PostgresSource {
             etl_schemas.insert(*table_id, etl_schema);
         }
 
-        let cdc_dest =
-            EtlBigQueryDestination::new(dest.clone(), table_info_map.clone(), stats.clone());
+        let cdc_dest = EtlBigQueryDestination::new(
+            dest.clone(),
+            table_info_map.clone(),
+            stats.clone(),
+            snapshot_concurrency,
+        );
 
         let slot_name: String = EtlReplicationSlot::for_apply_worker(pipeline_id)
             .try_into()
@@ -639,9 +682,7 @@ impl PostgresSource {
                 return Err(err.into());
             }
 
-            let (transaction, slot) = replication_client
-                .create_slot_with_transaction(&slot_name)
-                .await?;
+            let (slot_guard, slot) = self.create_exported_snapshot_slot(&slot_name).await?;
 
             let snapshot_table_ids: HashSet<TableId> =
                 if mode == crate::types::SyncMode::Full || last_lsn.is_none() {
@@ -664,49 +705,70 @@ impl PostgresSource {
                 }
             }
 
-            for (table_id, info) in table_info_map.iter() {
-                if !snapshot_table_ids.contains(table_id) {
-                    continue;
-                }
-                let etl_schema = etl_schemas
+            let mut snapshot_tasks_to_run = Vec::with_capacity(snapshot_table_ids.len());
+            for table_id in &snapshot_table_ids {
+                let table = table_ids
                     .get(table_id)
-                    .context("missing table schema for CDC copy")?;
-                info!(table = %info.source_name, "starting CDC snapshot copy");
-                let copy_stream = transaction
-                    .get_table_copy_stream(*table_id, &etl_schema.column_schemas, Some(publication))
-                    .await?;
-                let stream =
-                    TableCopyStream::wrap(copy_stream, &etl_schema.column_schemas, pipeline_id);
-                tokio::pin!(stream);
-                let mut buffer: Vec<TableRow> = Vec::with_capacity(batch_size);
-                while let Some(result) = stream.next().await {
-                    let row = result?;
-                    buffer.push(row);
-                    if buffer.len() >= batch_size {
-                        if let Some(stats) = &stats {
-                            stats
-                                .record_extract(&info.source_name, buffer.len(), 0)
-                                .await;
-                        }
-                        cdc_dest
-                            .write_table_rows(*table_id, std::mem::take(&mut buffer))
-                            .await?;
-                    }
-                }
-                if !buffer.is_empty() {
-                    if let Some(stats) = &stats {
-                        stats
-                            .record_extract(&info.source_name, buffer.len(), 0)
-                            .await;
-                    }
-                    cdc_dest.write_table_rows(*table_id, buffer).await?;
-                }
-                info!(table = %info.source_name, "completed CDC snapshot copy");
+                    .cloned()
+                    .context("missing table config for CDC snapshot")?;
+                let info = table_info_map
+                    .get(table_id)
+                    .cloned()
+                    .context("missing table info for CDC snapshot")?;
+                snapshot_tasks_to_run.push(CdcSnapshotTask { table, info });
             }
 
-            transaction.commit().await?;
-            start_lsn = Some(slot.consistent_point);
-            last_lsn = Some(slot.consistent_point.to_string());
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(snapshot_concurrency));
+            let mut snapshot_tasks = FuturesUnordered::new();
+            for snapshot_task in snapshot_tasks_to_run {
+                let permit_pool = Arc::clone(&semaphore);
+                let snapshot_name = slot.snapshot_name.clone();
+                let source = self;
+                let dest = dest.clone();
+                let stats = stats.clone();
+                snapshot_tasks.push(async move {
+                    let permit = permit_pool
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| anyhow::anyhow!("failed to acquire CDC snapshot permit"))?;
+                    let _permit = permit;
+                    info!(
+                        table = %snapshot_task.info.source_name,
+                        snapshot_name = %snapshot_name,
+                        batch_size,
+                        snapshot_concurrency,
+                        "starting exported CDC snapshot copy"
+                    );
+                    source
+                        .run_snapshot_copy_with_exported_snapshot(
+                            &snapshot_task.table,
+                            &snapshot_task.info.schema,
+                            &dest,
+                            &snapshot_name,
+                            batch_size,
+                            stats,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "copying exported snapshot for {}",
+                                snapshot_task.info.source_name
+                            )
+                        })?;
+                    Ok::<(), anyhow::Error>(())
+                });
+            }
+
+            while let Some(result) = snapshot_tasks.next().await {
+                result?;
+            }
+
+            drop(slot_guard);
+            let snapshot_start_lsn = slot.consistent_point.parse().map_err(|_| {
+                anyhow::anyhow!("invalid slot consistent_point '{}'", slot.consistent_point)
+            })?;
+            start_lsn = Some(snapshot_start_lsn);
+            last_lsn = Some(slot.consistent_point);
         }
 
         let start_lsn = match (start_lsn, last_lsn.as_deref()) {
@@ -730,6 +792,7 @@ impl PostgresSource {
                     pipeline_id,
                     idle_timeout,
                     max_pending_events,
+                    apply_concurrency: snapshot_concurrency,
                     follow,
                     shutdown: shutdown.clone(),
                 },
@@ -1089,6 +1152,167 @@ impl PostgresSource {
         })
     }
 
+    async fn create_exported_snapshot_slot(
+        &self,
+        slot_name: &str,
+    ) -> Result<(ExportedSnapshotSlot, ExportedSnapshotSlotInfo)> {
+        let pg_config = self.build_pg_connection_config().await?;
+        let client = connect_replication_control_client(&pg_config).await?;
+        let info = create_exported_snapshot_slot_info(&client, slot_name).await?;
+        Ok((ExportedSnapshotSlot { _client: client }, info))
+    }
+
+    async fn run_snapshot_copy_with_exported_snapshot(
+        &self,
+        table: &ResolvedPostgresTable,
+        schema: &TableSchema,
+        dest: &dyn Destination,
+        snapshot_name: &str,
+        batch_size: usize,
+        stats: Option<StatsHandle>,
+    ) -> Result<()> {
+        let (schema_name, table_name) = split_table_name(&table.name);
+
+        if !schema.columns.is_empty() {
+            dest.ensure_table(schema).await?;
+        }
+
+        let pk_cast = self
+            .resolve_primary_key_cast(&schema_name, &table_name, &table.primary_key)
+            .await?;
+        let pk_alias = "__cdsync_pk";
+        let select_columns = schema
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let select_expr = format!(
+            "{}, {}::text as {}",
+            select_columns, table.primary_key, pk_alias
+        );
+        let has_where = table.where_clause.is_some();
+        let base_sql = if let Some(where_clause) = &table.where_clause {
+            format!(
+                "SELECT {select} FROM {schema}.{table} WHERE ({where_clause})",
+                select = select_expr,
+                schema = schema_name,
+                table = table_name,
+                where_clause = where_clause
+            )
+        } else {
+            format!(
+                "SELECT {select} FROM {schema}.{table}",
+                select = select_expr,
+                schema = schema_name,
+                table = table_name
+            )
+        };
+        let sql_without_pk = format!("{} ORDER BY {} LIMIT $1", base_sql, table.primary_key);
+        let sql_with_pk = if has_where {
+            format!(
+                "{} AND {} > $1::{} ORDER BY {} LIMIT $2",
+                base_sql, table.primary_key, pk_cast, table.primary_key
+            )
+        } else {
+            format!(
+                "{} WHERE {} > $1::{} ORDER BY {} LIMIT $2",
+                base_sql, table.primary_key, pk_cast, table.primary_key
+            )
+        };
+
+        let mut connection = acquire_exported_snapshot_reader(&self.pool, snapshot_name).await?;
+        let mut last_pk: Option<String> = None;
+        let mut extracted_rows = 0usize;
+        let mut loaded_batches = 0usize;
+        let mut completed = false;
+
+        let run_result: Result<()> = async {
+            loop {
+                let extract_start = Instant::now();
+                let rows = if let Some(last_pk_value) = last_pk.as_ref() {
+                    sqlx::query(&sql_with_pk)
+                        .bind(last_pk_value)
+                        .bind(batch_size as i64)
+                        .fetch_all(&mut *connection)
+                        .await?
+                } else {
+                    sqlx::query(&sql_without_pk)
+                        .bind(batch_size as i64)
+                        .fetch_all(&mut *connection)
+                        .await?
+                };
+                let extract_ms = extract_start.elapsed().as_millis() as u64;
+
+                if rows.is_empty() {
+                    break;
+                }
+
+                extracted_rows += rows.len();
+                let batch = rows_to_batch(schema, &rows, table, Utc::now(), &self.metadata)?;
+                if let Some(stats) = &stats {
+                    stats
+                        .record_extract(&table.name, rows.len(), extract_ms)
+                        .await;
+                }
+
+                let load_start = Instant::now();
+                dest.write_batch(
+                    &schema.name,
+                    schema,
+                    &batch,
+                    WriteMode::Append,
+                    Some(&table.primary_key),
+                )
+                .await?;
+                if let Some(stats) = &stats {
+                    stats
+                        .record_load(
+                            &table.name,
+                            rows.len(),
+                            0,
+                            0,
+                            load_start.elapsed().as_millis() as u64,
+                        )
+                        .await;
+                }
+
+                loaded_batches += 1;
+                if should_log_snapshot_progress(loaded_batches) {
+                    info!(
+                        table = %table.name,
+                        extracted_rows,
+                        loaded_batches,
+                        snapshot_name,
+                        "exported snapshot copy progress"
+                    );
+                }
+
+                last_pk = Some(
+                    rows.last()
+                        .and_then(|row| row.try_get(pk_alias).ok())
+                        .context("missing primary key value for snapshot pagination")?,
+                );
+            }
+
+            completed = true;
+            Ok(())
+        }
+        .await;
+
+        release_exported_snapshot_reader(&mut connection, completed).await?;
+        run_result?;
+
+        info!(
+            table = %table.name,
+            extracted_rows,
+            loaded_batches,
+            snapshot_name,
+            "completed exported snapshot copy"
+        );
+        Ok(())
+    }
+
     async fn resolve_table_ids(
         &self,
         tables: &[ResolvedPostgresTable],
@@ -1290,6 +1514,7 @@ impl PostgresSource {
             pipeline_id,
             idle_timeout,
             max_pending_events,
+            apply_concurrency,
             follow,
             shutdown,
         } = config;
@@ -1320,6 +1545,13 @@ impl PostgresSource {
         let mut expected_commit_lsn: Option<etl::types::PgLsn> = None;
         let mut shutdown = shutdown;
         let mut shutdown_requested = false;
+        let mut next_commit_sequence = 0u64;
+        let mut queued_batches: VecDeque<CommittedCdcBatch> = VecDeque::new();
+        let mut inflight_apply: FuturesUnordered<CdcApplyFuture> = FuturesUnordered::new();
+        let mut watermark_tracker = CdcWatermarkTracker::default();
+        let mut table_apply_locks: HashMap<TableId, Arc<Mutex<()>>> = HashMap::new();
+        let max_inflight_commits = apply_concurrency.max(1);
+        let max_commit_queue_depth = max_inflight_commits.saturating_mul(4).max(1);
 
         loop {
             if shutdown_requested && !in_tx {
@@ -1414,34 +1646,48 @@ impl PostgresSource {
                                 );
                             }
 
-                            if !pending_events.is_empty() {
-                                dest.write_events(std::mem::take(&mut pending_events))
-                                    .await?;
-                            }
-                            if let Some(stats) = &stats {
-                                for (table_id, count) in pending_stats.drain() {
-                                    if let Some(cfg) = table_configs.get(&table_id) {
-                                        stats.record_extract(&cfg.name, count, 0).await;
-                                    }
-                                }
-                            } else {
-                                pending_stats.clear();
-                            }
+                            let table_batches =
+                                split_commit_events_by_table(std::mem::take(&mut pending_events));
+                            let stats_by_table = std::mem::take(&mut pending_stats);
+                            queued_batches.push_back(CommittedCdcBatch {
+                                sequence: next_commit_sequence,
+                                commit_lsn,
+                                table_batches,
+                                stats: stats_by_table,
+                            });
+                            next_commit_sequence += 1;
 
-                            last_flushed_lsn = commit_lsn;
-                            stream
-                                .as_mut()
-                                .send_status_update(
+                            dispatch_cdc_batches(
+                                &mut queued_batches,
+                                &mut inflight_apply,
+                                &mut watermark_tracker,
+                                dest,
+                                &mut table_apply_locks,
+                                max_inflight_commits,
+                            );
+
+                            while queued_batches.len() >= max_commit_queue_depth {
+                                let Some(advance) = drain_one_cdc_apply(
+                                    &mut inflight_apply,
+                                    &mut watermark_tracker,
+                                )
+                                .await?
+                                else {
+                                    break;
+                                };
+                                apply_cdc_watermark_advance(
+                                    advance,
+                                    &mut CdcWatermarkRuntime {
+                                        stats: &stats,
+                                        table_configs,
+                                        state,
+                                        state_handle: state_handle.as_ref(),
+                                    },
+                                    stream.as_mut(),
                                     last_received_lsn,
-                                    last_flushed_lsn,
-                                    true,
-                                    StatusUpdateType::KeepAlive,
+                                    &mut last_flushed_lsn,
                                 )
                                 .await?;
-                            let cdc_state = state.postgres_cdc.get_or_insert_with(Default::default);
-                            cdc_state.last_lsn = Some(last_flushed_lsn.to_string());
-                            if let Some(state_handle) = &state_handle {
-                                state_handle.save_postgres_cdc_state(cdc_state).await?;
                             }
                             in_tx = false;
                         }
@@ -1450,6 +1696,11 @@ impl PostgresSource {
                             if !include_tables.contains(&table_id) {
                                 continue;
                             }
+                            let table_lock = table_apply_locks
+                                .entry(table_id)
+                                .or_insert_with(|| Arc::new(Mutex::new(())))
+                                .clone();
+                            let _guard = table_lock.lock().await;
                             let mut relation_runtime = CdcRelationRuntime {
                                 table_configs,
                                 store,
@@ -1600,6 +1851,59 @@ impl PostgresSource {
                 }
                 _ => {}
             }
+
+            while let Some(result) = inflight_apply.next().now_or_never() {
+                let Some(advance) = handle_cdc_apply_result(result, &mut watermark_tracker)? else {
+                    continue;
+                };
+                apply_cdc_watermark_advance(
+                    advance,
+                    &mut CdcWatermarkRuntime {
+                        stats: &stats,
+                        table_configs,
+                        state,
+                        state_handle: state_handle.as_ref(),
+                    },
+                    stream.as_mut(),
+                    last_received_lsn,
+                    &mut last_flushed_lsn,
+                )
+                .await?;
+            }
+        }
+
+        dispatch_cdc_batches(
+            &mut queued_batches,
+            &mut inflight_apply,
+            &mut watermark_tracker,
+            dest,
+            &mut table_apply_locks,
+            max_inflight_commits,
+        );
+        while let Some(advance) =
+            drain_one_cdc_apply(&mut inflight_apply, &mut watermark_tracker).await?
+        {
+            apply_cdc_watermark_advance(
+                advance,
+                &mut CdcWatermarkRuntime {
+                    stats: &stats,
+                    table_configs,
+                    state,
+                    state_handle: state_handle.as_ref(),
+                },
+                stream.as_mut(),
+                last_received_lsn,
+                &mut last_flushed_lsn,
+            )
+            .await?;
+            dispatch_cdc_batches(
+                &mut queued_batches,
+                &mut inflight_apply,
+                &mut watermark_tracker,
+                dest,
+                &mut table_apply_locks,
+                max_inflight_commits,
+            );
         }
 
         Ok(last_flushed_lsn)
@@ -1696,578 +2000,123 @@ fn split_table_name(table: &str) -> (String, String) {
     }
 }
 
-fn normalize_filter(value: &str) -> String {
-    let mut trimmed = value.trim();
-    while let Some(stripped) = trimmed.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-        trimmed = stripped.trim();
-    }
-    trimmed
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-}
+async fn connect_replication_control_client(
+    pg_config: &PgConnectionConfig,
+) -> Result<TokioPgClient> {
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host(pg_config.host.clone())
+        .port(pg_config.port)
+        .dbname(pg_config.name.clone())
+        .user(pg_config.username.clone())
+        .replication_mode(ReplicationMode::Logical);
 
-fn schema_fingerprint(schema: &TableSchema) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for column in &schema.columns {
-        column.name.hash(&mut hasher);
-        column.data_type.hash(&mut hasher);
-        column.nullable.hash(&mut hasher);
-    }
-    schema.primary_key.hash(&mut hasher);
-    format!("{:x}", hasher.finish())
-}
-
-#[derive(Debug, Default)]
-struct SchemaDiff {
-    added: Vec<String>,
-    removed: Vec<String>,
-    type_changed: Vec<(String, DataType, DataType)>,
-    nullable_changed: Vec<(String, bool, bool)>,
-}
-
-impl SchemaDiff {
-    fn is_empty(&self) -> bool {
-        self.added.is_empty()
-            && self.removed.is_empty()
-            && self.type_changed.is_empty()
-            && self.nullable_changed.is_empty()
+    if let Some(password) = &pg_config.password {
+        config.password(password.expose_secret());
     }
 
-    fn has_incompatible(&self) -> bool {
-        !self.removed.is_empty()
-            || !self.type_changed.is_empty()
-            || !self.nullable_changed.is_empty()
-    }
-}
-
-fn schema_snapshot_from_schema(schema: &TableSchema) -> Vec<SchemaFieldSnapshot> {
-    schema
-        .columns
-        .iter()
-        .map(|col| SchemaFieldSnapshot {
-            name: col.name.clone(),
-            data_type: col.data_type.clone(),
-            nullable: col.nullable,
-        })
-        .collect()
-}
-
-fn schema_diff(
-    previous: Option<&[SchemaFieldSnapshot]>,
-    current: &TableSchema,
-) -> Option<SchemaDiff> {
-    let previous = previous?;
-    let mut diff = SchemaDiff::default();
-    let mut prev_map: HashMap<&str, &SchemaFieldSnapshot> = HashMap::new();
-    for col in previous {
-        prev_map.insert(col.name.as_str(), col);
-    }
-
-    let mut current_names = HashSet::new();
-    for col in &current.columns {
-        current_names.insert(col.name.as_str());
-        if let Some(prev) = prev_map.get(col.name.as_str()) {
-            if prev.data_type != col.data_type {
-                diff.type_changed.push((
-                    col.name.clone(),
-                    prev.data_type.clone(),
-                    col.data_type.clone(),
-                ));
-            } else if prev.nullable != col.nullable {
-                diff.nullable_changed
-                    .push((col.name.clone(), prev.nullable, col.nullable));
+    if pg_config.tls.enabled {
+        let mut builder = native_tls::TlsConnector::builder();
+        if !pg_config.tls.trusted_root_certs.is_empty() {
+            builder.add_root_certificate(Certificate::from_pem(
+                pg_config.tls.trusted_root_certs.as_bytes(),
+            )?);
+        }
+        let connector = MakeNativeTlsConnect::new(builder.build()?);
+        let (client, connection) = config.connect(connector).await?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::error!(error = %err, "exported snapshot replication connection error");
             }
-        } else {
-            diff.added.push(col.name.clone());
-        }
-    }
-
-    for prev in previous {
-        if !current_names.contains(prev.name.as_str()) {
-            diff.removed.push(prev.name.clone());
-        }
-    }
-
-    Some(diff)
-}
-
-fn log_schema_diff(table: &str, diff: &SchemaDiff) {
-    if !diff.added.is_empty() {
-        info!(table = %table, added = ?diff.added, "schema change: added columns");
-    }
-    if !diff.removed.is_empty() {
-        warn!(table = %table, removed = ?diff.removed, "schema change: removed columns");
-    }
-    if !diff.type_changed.is_empty() {
-        warn!(table = %table, type_changed = ?diff.type_changed, "schema change: column type changes");
-    }
-    if !diff.nullable_changed.is_empty() {
-        warn!(
-            table = %table,
-            nullable_changed = ?diff.nullable_changed,
-            "schema change: nullable changes"
-        );
-    }
-}
-
-fn build_globset(patterns: &[String]) -> Result<GlobSet> {
-    let mut builder = globset::GlobSetBuilder::new();
-    for pattern in patterns {
-        builder.add(Glob::new(pattern)?);
-    }
-    Ok(builder.build()?)
-}
-
-fn collect_table_configs(
-    explicit_tables: Option<&[PostgresTableConfig]>,
-    selection: Option<&TableSelectionConfig>,
-    discovered_names: &[String],
-) -> Result<Vec<PostgresTableConfig>> {
-    let mut table_map: HashMap<String, PostgresTableConfig> = HashMap::new();
-
-    if let Some(tables) = explicit_tables {
-        for table in tables {
-            table_map.insert(table.name.clone(), table.clone());
-        }
-    }
-
-    if let Some(selection) = selection {
-        if !selection.include.is_empty() || !selection.exclude.is_empty() {
-            let include_set = build_globset(&selection.include)?;
-            let exclude_set = build_globset(&selection.exclude)?;
-
-            for name in discovered_names {
-                if !selection.include.is_empty() && !include_set.is_match(name) {
-                    continue;
-                }
-                if !selection.exclude.is_empty() && exclude_set.is_match(name) {
-                    continue;
-                }
-                table_map
-                    .entry(name.clone())
-                    .or_insert(PostgresTableConfig {
-                        name: name.clone(),
-                        primary_key: None,
-                        updated_at_column: None,
-                        soft_delete: None,
-                        soft_delete_column: None,
-                        where_clause: None,
-                        columns: None,
-                    });
+        });
+        Ok(client)
+    } else {
+        config.ssl_mode(tokio_postgres::config::SslMode::Prefer);
+        let (client, connection) = config.connect(NoTls).await?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                tracing::error!(error = %err, "exported snapshot replication connection error");
             }
-        }
-
-        if !selection.exclude.is_empty() {
-            let exclude_set = build_globset(&selection.exclude)?;
-            table_map.retain(|name, _| !exclude_set.is_match(name));
-        }
+        });
+        Ok(client)
     }
-
-    if table_map.is_empty() {
-        anyhow::bail!("no postgres tables resolved from config");
-    }
-
-    let mut table_configs: Vec<PostgresTableConfig> = table_map.into_values().collect();
-    table_configs.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(table_configs)
 }
 
-fn required_columns(table: &ResolvedPostgresTable) -> HashSet<String> {
-    let mut required = HashSet::new();
-    required.insert(table.primary_key.clone());
-    if let Some(updated_at) = &table.updated_at_column {
-        required.insert(updated_at.clone());
+async fn create_exported_snapshot_slot_info(
+    client: &TokioPgClient,
+    slot_name: &str,
+) -> Result<ExportedSnapshotSlotInfo> {
+    let query = format!(
+        "CREATE_REPLICATION_SLOT {} LOGICAL pgoutput EXPORT_SNAPSHOT",
+        quote_pg_identifier(slot_name)
+    );
+
+    for message in client.simple_query(&query).await? {
+        if let SimpleQueryMessage::Row(row) = message {
+            let consistent_point = row
+                .get("consistent_point")
+                .context("replication slot response missing consistent_point")?
+                .to_string();
+            let snapshot_name = row
+                .get("snapshot_name")
+                .context("replication slot response missing snapshot_name")?
+                .to_string();
+            if snapshot_name.is_empty() {
+                anyhow::bail!("replication slot response returned empty snapshot_name");
+            }
+            return Ok(ExportedSnapshotSlotInfo {
+                consistent_point,
+                snapshot_name,
+            });
+        }
     }
-    if table.soft_delete
-        && let Some(column) = &table.soft_delete_column
+
+    anyhow::bail!("replication slot creation returned no row")
+}
+
+async fn acquire_exported_snapshot_reader(
+    pool: &PgPool,
+    snapshot_name: &str,
+) -> Result<PoolConnection<sqlx::Postgres>> {
+    let mut connection = pool.acquire().await?;
+    sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *connection)
+        .await
+        .with_context(|| "starting exported snapshot reader transaction")?;
+    if let Err(err) = sqlx::query(&format!(
+        "SET TRANSACTION SNAPSHOT {}",
+        quote_pg_literal(snapshot_name)
+    ))
+    .execute(&mut *connection)
+    .await
     {
-        required.insert(column.clone());
+        let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+        return Err(err).with_context(|| {
+            format!(
+                "importing exported snapshot {} into snapshot reader transaction",
+                snapshot_name
+            )
+        });
     }
-    required
+    Ok(connection)
 }
 
-fn ensure_required_columns(all_columns: &[ColumnSchema], required: &HashSet<String>) -> Result<()> {
-    for name in required {
-        if !all_columns.iter().any(|c| &c.name == name) {
-            anyhow::bail!("required column {} not found in source table", name);
-        }
-    }
+async fn release_exported_snapshot_reader(
+    connection: &mut PoolConnection<sqlx::Postgres>,
+    commit: bool,
+) -> Result<()> {
+    let statement = if commit { "COMMIT" } else { "ROLLBACK" };
+    sqlx::query(statement).execute(&mut **connection).await?;
     Ok(())
 }
 
-fn filter_columns(
-    all_columns: &[ColumnSchema],
-    selection: &ColumnSelection,
-    required: &HashSet<String>,
-) -> Vec<ColumnSchema> {
-    let include_set: HashSet<&str> = selection.include.iter().map(|s| s.as_str()).collect();
-    let exclude_set: HashSet<&str> = selection.exclude.iter().map(|s| s.as_str()).collect();
-    let include_all = include_set.is_empty();
-
-    let mut filtered = Vec::new();
-    for column in all_columns {
-        let mut include = include_all || include_set.contains(column.name.as_str());
-        if exclude_set.contains(column.name.as_str()) {
-            include = false;
-        }
-        if required.contains(&column.name) {
-            include = true;
-        }
-        if include {
-            filtered.push(column.clone());
-        }
-    }
-    filtered
+fn quote_pg_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
-fn pg_type_to_data_type(data_type: &str) -> DataType {
-    match data_type {
-        "smallint" | "integer" | "bigint" => DataType::Int64,
-        "real" | "double precision" => DataType::Float64,
-        "numeric" | "decimal" => DataType::Numeric,
-        "boolean" => DataType::Bool,
-        "timestamp without time zone" | "timestamp with time zone" => DataType::Timestamp,
-        "date" => DataType::Date,
-        "json" | "jsonb" => DataType::Json,
-        "bytea" => DataType::Bytes,
-        _ => DataType::String,
-    }
+fn quote_pg_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
-
-fn rows_to_batch(
-    schema: &TableSchema,
-    rows: &[PgRow],
-    table: &ResolvedPostgresTable,
-    synced_at: DateTime<Utc>,
-    metadata: &MetadataColumns,
-) -> Result<DataFrame> {
-    let polars_schema = polars_schema_with_metadata(schema, metadata)?;
-    let mut output: Vec<PolarsRow> = Vec::with_capacity(rows.len());
-    for row in rows {
-        let mut values: Vec<AnyValue> = Vec::with_capacity(polars_schema.len());
-        for column in &schema.columns {
-            let value = pg_value_to_anyvalue(row, column)?;
-            values.push(value);
-        }
-
-        values.push(AnyValue::StringOwned(PlSmallStr::from(
-            synced_at.to_rfc3339(),
-        )));
-        let deleted_at = derive_deleted_at(row, table).unwrap_or(Value::Null);
-        match deleted_at {
-            Value::String(value) => values.push(AnyValue::StringOwned(PlSmallStr::from(value))),
-            _ => values.push(AnyValue::Null),
-        }
-        output.push(PolarsRow::new(values));
-    }
-
-    DataFrame::from_rows_and_schema(&output, &polars_schema).map_err(Into::into)
-}
-
-fn derive_deleted_at(row: &PgRow, table: &ResolvedPostgresTable) -> Option<Value> {
-    if !table.soft_delete {
-        return Some(Value::Null);
-    }
-    let column = table.soft_delete_column.as_ref()?;
-    let raw = row.try_get_raw(column.as_str()).ok()?;
-    if raw.is_null() {
-        return Some(Value::Null);
-    }
-
-    if let Ok(flag) = row.try_get::<bool, _>(column.as_str())
-        && flag
-    {
-        return Some(Value::String(Utc::now().to_rfc3339()));
-    }
-
-    if let Ok(ts) = row.try_get::<NaiveDateTime, _>(column.as_str()) {
-        let dt = Utc.from_utc_datetime(&ts);
-        return Some(Value::String(dt.to_rfc3339()));
-    }
-    if let Ok(ts) = row.try_get::<DateTime<Utc>, _>(column.as_str()) {
-        return Some(Value::String(ts.to_rfc3339()));
-    }
-
-    if let Ok(date) = row.try_get::<NaiveDate, _>(column.as_str()) {
-        return Some(Value::String(date.format("%Y-%m-%d").to_string()));
-    }
-
-    Some(Value::Null)
-}
-
-fn pg_value_to_anyvalue(row: &PgRow, column: &ColumnSchema) -> Result<AnyValue<'static>> {
-    let name = column.name.as_str();
-    let value = match column.data_type {
-        DataType::String => row
-            .try_get::<Option<String>, _>(name)?
-            .map(|v| AnyValue::StringOwned(PlSmallStr::from(v))),
-        DataType::Int64 => row.try_get::<Option<i64>, _>(name)?.map(AnyValue::Int64),
-        DataType::Float64 => row.try_get::<Option<f64>, _>(name)?.map(AnyValue::Float64),
-        DataType::Bool => row.try_get::<Option<bool>, _>(name)?.map(AnyValue::Boolean),
-        DataType::Timestamp => {
-            if let Ok(value) = row.try_get::<Option<NaiveDateTime>, _>(name) {
-                value
-                    .map(|v| Utc.from_utc_datetime(&v).to_rfc3339())
-                    .map(|v| AnyValue::StringOwned(PlSmallStr::from(v)))
-            } else if let Ok(value) = row.try_get::<Option<DateTime<Utc>>, _>(name) {
-                value
-                    .map(|v| v.to_rfc3339())
-                    .map(|v| AnyValue::StringOwned(PlSmallStr::from(v)))
-            } else {
-                None
-            }
-        }
-        DataType::Date => row
-            .try_get::<Option<NaiveDate>, _>(name)?
-            .map(|v| v.format("%Y-%m-%d").to_string())
-            .map(|v| AnyValue::StringOwned(PlSmallStr::from(v))),
-        DataType::Bytes => row
-            .try_get::<Option<Vec<u8>>, _>(name)?
-            .map(|v| AnyValue::StringOwned(PlSmallStr::from(encode_base64(&v)))),
-        DataType::Numeric => row
-            .try_get::<Option<bigdecimal::BigDecimal>, _>(name)?
-            .map(|v| AnyValue::StringOwned(PlSmallStr::from(v.to_string()))),
-        DataType::Json => row
-            .try_get::<Option<serde_json::Value>, _>(name)?
-            .map(|v| AnyValue::StringOwned(PlSmallStr::from(v.to_string()))),
-    };
-
-    Ok(value.unwrap_or(AnyValue::Null))
-}
-
-fn read_updated_at(row: &PgRow, updated_at: &str) -> Option<DateTime<Utc>> {
-    if let Ok(ts) = row.try_get::<NaiveDateTime, _>(updated_at) {
-        return Some(Utc.from_utc_datetime(&ts));
-    }
-    if let Ok(ts) = row.try_get::<DateTime<Utc>, _>(updated_at) {
-        return Some(ts);
-    }
-    None
-}
-
-fn read_primary_key(row: &PgRow, column: &str) -> Result<String> {
-    if let Ok(value) = row.try_get::<String, _>(column) {
-        return Ok(value);
-    }
-    if let Ok(value) = row.try_get::<i64, _>(column) {
-        return Ok(value.to_string());
-    }
-    if let Ok(value) = row.try_get::<i32, _>(column) {
-        return Ok(value.to_string());
-    }
-    if let Ok(value) = row.try_get::<BigDecimal, _>(column) {
-        return Ok(value.to_string());
-    }
-    if let Ok(value) = row.try_get::<Uuid, _>(column) {
-        return Ok(value.to_string());
-    }
-    if let Ok(value) = row.try_get::<bool, _>(column) {
-        return Ok(value.to_string());
-    }
-    let raw = row
-        .try_get::<serde_json::Value, _>(column)
-        .with_context(|| format!("unable to decode primary key column {}", column))?;
-    read_primary_key_from_value(raw)
-}
-
-fn build_incremental_sql(parts: &IncrementalSqlParts<'_>) -> String {
-    let mut where_clauses = Vec::new();
-    if let Some(where_clause) = parts.where_clause {
-        where_clauses.push(format!("({})", where_clause));
-    }
-    let pagination_clause = if parts.has_last_pk {
-        format!(
-            "({updated_at} > $1 OR ({updated_at} = $1 AND {pk} > $2::{pk_cast}))",
-            updated_at = parts.updated_at,
-            pk = parts.primary_key,
-            pk_cast = parts.pk_cast
-        )
-    } else {
-        format!("{updated_at} > $1", updated_at = parts.updated_at)
-    };
-    where_clauses.push(pagination_clause);
-    let where_sql = format!(" WHERE {}", where_clauses.join(" AND "));
-    let limit_placeholder = if parts.has_last_pk { "$3" } else { "$2" };
-    format!(
-        "SELECT {columns} FROM {schema}.{table}{where_sql} ORDER BY {updated_at} ASC, {pk} ASC LIMIT {limit}",
-        columns = parts.columns,
-        schema = parts.schema,
-        table = parts.table,
-        where_sql = where_sql,
-        updated_at = parts.updated_at,
-        pk = parts.primary_key,
-        limit = limit_placeholder
-    )
-}
-
-fn read_primary_key_from_value(value: Value) -> Result<String> {
-    match value {
-        Value::String(value) => Ok(value),
-        Value::Number(value) => Ok(value.to_string()),
-        Value::Bool(value) => Ok(value.to_string()),
-        Value::Null => anyhow::bail!("primary key value is null"),
-        other => Ok(other.to_string()),
-    }
-}
-
-fn format_cast_type(udt_name: &str, udt_schema: &str) -> String {
-    if udt_schema == "pg_catalog" {
-        udt_name.to_string()
-    } else {
-        format!("{}.{}", udt_schema, udt_name)
-    }
-}
-
-fn encode_base64(bytes: &[u8]) -> String {
-    STANDARD.encode(bytes)
-}
-
-fn polars_schema_with_metadata(schema: &TableSchema, metadata: &MetadataColumns) -> Result<Schema> {
-    let mut fields: Vec<Field> = Vec::with_capacity(schema.columns.len() + 2);
-    for column in &schema.columns {
-        let dtype = match column.data_type {
-            DataType::Int64 => PolarsDataType::Int64,
-            DataType::Float64 => PolarsDataType::Float64,
-            DataType::Bool => PolarsDataType::Boolean,
-            _ => PolarsDataType::String,
-        };
-        fields.push(Field::new(column.name.as_str().into(), dtype));
-    }
-    fields.push(Field::new(
-        metadata.synced_at.as_str().into(),
-        PolarsDataType::String,
-    ));
-    fields.push(Field::new(
-        metadata.deleted_at.as_str().into(),
-        PolarsDataType::String,
-    ));
-    Ok(Schema::from_iter(fields))
-}
-
-fn pg_type_to_data_type_from_type(typ: &etl::types::Type) -> DataType {
-    use etl::types::Type;
-    match *typ {
-        Type::INT2 | Type::INT4 | Type::INT8 => DataType::Int64,
-        Type::FLOAT4 | Type::FLOAT8 => DataType::Float64,
-        Type::BOOL => DataType::Bool,
-        Type::TIMESTAMP | Type::TIMESTAMPTZ => DataType::Timestamp,
-        Type::DATE => DataType::Date,
-        Type::JSON | Type::JSONB => DataType::Json,
-        Type::BYTEA => DataType::Bytes,
-        Type::NUMERIC => DataType::Numeric,
-        _ => DataType::String,
-    }
-}
-
-fn cdc_table_info_from_schema(
-    table_cfg: &ResolvedPostgresTable,
-    etl_schema: &EtlTableSchema,
-    metadata: &MetadataColumns,
-) -> Result<CdcTableInfo> {
-    let source_columns: Vec<ColumnSchema> = etl_schema
-        .column_schemas
-        .iter()
-        .map(|col| ColumnSchema {
-            name: col.name.clone(),
-            data_type: pg_type_to_data_type_from_type(&col.typ),
-            nullable: col.nullable,
-        })
-        .collect();
-
-    let required = required_columns(table_cfg);
-    ensure_required_columns(&source_columns, &required)?;
-    let dest_columns = filter_columns(&source_columns, &table_cfg.columns, &required);
-
-    let schema = TableSchema {
-        name: crate::types::destination_table_name(&etl_schema.name.to_string()),
-        columns: dest_columns,
-        primary_key: Some(table_cfg.primary_key.clone()),
-    };
-
-    if !schema
-        .columns
-        .iter()
-        .any(|c| c.name == table_cfg.primary_key)
-    {
-        anyhow::bail!(
-            "primary key {} not found in table {}",
-            table_cfg.primary_key,
-            etl_schema.name
-        );
-    }
-
-    CdcTableInfo::new(
-        crate::destinations::etl_bigquery::CdcTableSpec {
-            table_id: etl_schema.id,
-            source_name: etl_schema.name.to_string(),
-            dest_name: schema.name.clone(),
-            schema,
-            metadata: metadata.clone(),
-            primary_key: table_cfg.primary_key.clone(),
-            soft_delete: table_cfg.soft_delete,
-            soft_delete_column: table_cfg.soft_delete_column.clone(),
-        },
-        etl_schema,
-    )
-}
-
-fn tuple_to_row(
-    column_schemas: &[etl_postgres::types::ColumnSchema],
-    tuple_data: &[TupleData],
-    old_row: Option<&TableRow>,
-) -> Result<TableRow> {
-    let mut values = Vec::with_capacity(column_schemas.len());
-
-    for (idx, column_schema) in column_schemas.iter().enumerate() {
-        let value = match tuple_data.get(idx) {
-            Some(TupleData::Null) => Cell::Null,
-            Some(TupleData::UnchangedToast) => old_row
-                .and_then(|row| row.values.get(idx).cloned())
-                .unwrap_or(Cell::Null),
-            Some(TupleData::Text(bytes)) => {
-                let text = String::from_utf8_lossy(bytes);
-                parse_text_cell(&column_schema.typ, &text)
-            }
-            Some(TupleData::Binary(bytes)) => Cell::Bytes(bytes.to_vec()),
-            None => Cell::Null,
-        };
-        values.push(value);
-    }
-
-    Ok(TableRow::new(values))
-}
-
-fn parse_text_cell(typ: &etl::types::Type, text: &str) -> Cell {
-    use etl::types::Type;
-    match *typ {
-        Type::BOOL => match text {
-            "t" | "true" | "TRUE" => Cell::Bool(true),
-            "f" | "false" | "FALSE" => Cell::Bool(false),
-            _ => Cell::String(text.to_string()),
-        },
-        Type::INT2 | Type::INT4 | Type::INT8 => text
-            .parse::<i64>()
-            .map(Cell::I64)
-            .unwrap_or_else(|_| Cell::String(text.to_string())),
-        Type::FLOAT4 | Type::FLOAT8 => text
-            .parse::<f64>()
-            .map(Cell::F64)
-            .unwrap_or_else(|_| Cell::String(text.to_string())),
-        Type::BYTEA => parse_bytea(text)
-            .map(Cell::Bytes)
-            .unwrap_or_else(|_| Cell::String(text.to_string())),
-        _ => Cell::String(text.to_string()),
-    }
-}
-
-fn parse_bytea(text: &str) -> Result<Vec<u8>> {
-    if let Some(hex) = text.strip_prefix("\\x") {
-        return hex::decode(hex).context("invalid bytea hex");
-    }
-    Ok(text.as_bytes().to_vec())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2494,5 +2343,14 @@ mod tests {
         assert!(diff.added.contains(&"extra".to_string()));
         assert!(diff.removed.contains(&"id".to_string()));
         assert!(diff.type_changed.iter().any(|(name, _, _)| name == "name"));
+    }
+
+    #[test]
+    fn snapshot_progress_logging_uses_ten_batch_interval() {
+        assert!(!should_log_snapshot_progress(0));
+        assert!(!should_log_snapshot_progress(9));
+        assert!(should_log_snapshot_progress(10));
+        assert!(!should_log_snapshot_progress(11));
+        assert!(should_log_snapshot_progress(20));
     }
 }

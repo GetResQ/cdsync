@@ -1,13 +1,13 @@
+use crate::config::StateConfig;
 use crate::types::TableCheckpoint;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use sqlx::Row;
-use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::migrate::Migrator;
+use sqlx::postgres::{PgPoolOptions, PgRow};
 use std::collections::HashMap;
-use std::path::Path;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 const LOCK_TTL_SECONDS: u64 = 60;
 const LOCK_HEARTBEAT_SECONDS: u64 = 15;
+static STATE_MIGRATOR: Migrator = sqlx::migrate!("./migrations/state");
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SyncState {
@@ -46,7 +47,8 @@ pub struct ConnectionState {
 
 #[derive(Clone)]
 pub struct SyncStateStore {
-    pool: SqlitePool,
+    pool: PgPool,
+    schema: String,
     lock_ttl: Duration,
 }
 
@@ -69,25 +71,34 @@ struct LeaseCleanup {
 }
 
 impl SyncState {
-    pub async fn load(path: &Path) -> anyhow::Result<Self> {
-        let store = SyncStateStore::open(path).await?;
+    pub async fn load_with_config(config: &StateConfig) -> anyhow::Result<Self> {
+        let store = SyncStateStore::open_with_config(config).await?;
         store.load_state().await
     }
 }
 
 impl SyncStateStore {
-    pub async fn open(path: &Path) -> anyhow::Result<Self> {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
-            .create_if_missing(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(options)
-            .await?;
+    pub async fn migrate_with_config(config: &StateConfig) -> anyhow::Result<()> {
+        validate_schema_name(config.schema_name())?;
+        let pool = PgPoolOptions::new().max_connections(5).connect(&config.url).await?;
         let store = Self {
             pool,
+            schema: config.schema_name().to_string(),
+            lock_ttl: Duration::from_secs(LOCK_TTL_SECONDS),
+        };
+        store.migrate().await
+    }
+
+    pub async fn open_with_config(config: &StateConfig) -> anyhow::Result<Self> {
+        Self::open(&config.url, config.schema_name()).await
+    }
+
+    pub async fn open(url: &str, schema: &str) -> anyhow::Result<Self> {
+        validate_schema_name(schema)?;
+        let pool = PgPoolOptions::new().max_connections(5).connect(url).await?;
+        let store = Self {
+            pool,
+            schema: schema.to_string(),
             lock_ttl: Duration::from_secs(LOCK_TTL_SECONDS),
         };
         store.init().await?;
@@ -102,29 +113,17 @@ impl SyncStateStore {
     }
 
     pub async fn load_state(&self) -> anyhow::Result<SyncState> {
-        let rows = sqlx::query(
-            r#"
-            select
-                connection_id,
-                last_sync_started_at,
-                last_sync_finished_at,
-                last_sync_status,
-                last_error,
-                postgres_cdc_last_lsn,
-                postgres_cdc_slot_name,
-                updated_at
-            from connection_state
-            "#,
-        )
+        let rows = sqlx::query(&format!(
+            "select connection_id, last_sync_started_at, last_sync_finished_at, last_sync_status, last_error, postgres_cdc_last_lsn, postgres_cdc_slot_name, updated_at from {}",
+            self.table("connection_state")
+        ))
         .fetch_all(&self.pool)
         .await?;
 
-        let checkpoint_rows = sqlx::query(
-            r#"
-            select connection_id, source_kind, entity_name, checkpoint_json
-            from table_checkpoints
-            "#,
-        )
+        let checkpoint_rows = sqlx::query(&format!(
+            "select connection_id, source_kind, entity_name, checkpoint_json from {}",
+            self.table("table_checkpoints")
+        ))
         .fetch_all(&self.pool)
         .await?;
 
@@ -176,6 +175,11 @@ impl SyncStateStore {
         })
     }
 
+    pub async fn ping(&self) -> anyhow::Result<()> {
+        let _: i64 = sqlx::query_scalar("select 1").fetch_one(&self.pool).await?;
+        Ok(())
+    }
+
     pub async fn save_connection_state(
         &self,
         connection_id: &str,
@@ -201,9 +205,9 @@ impl SyncStateStore {
     ) -> anyhow::Result<()> {
         let updated_at = now_millis();
         let cdc_state = connection_state.postgres_cdc.as_ref();
-        sqlx::query(
+        sqlx::query(&format!(
             r#"
-            insert into connection_state (
+            insert into {} (
                 connection_id,
                 last_sync_started_at,
                 last_sync_finished_at,
@@ -212,7 +216,7 @@ impl SyncStateStore {
                 postgres_cdc_last_lsn,
                 postgres_cdc_slot_name,
                 updated_at
-            ) values (?, ?, ?, ?, ?, ?, ?, ?)
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8)
             on conflict(connection_id) do update set
                 last_sync_started_at = excluded.last_sync_started_at,
                 last_sync_finished_at = excluded.last_sync_finished_at,
@@ -222,7 +226,8 @@ impl SyncStateStore {
                 postgres_cdc_slot_name = excluded.postgres_cdc_slot_name,
                 updated_at = excluded.updated_at
             "#,
-        )
+            self.table("connection_state")
+        ))
         .bind(connection_id)
         .bind(
             connection_state
@@ -254,20 +259,21 @@ impl SyncStateStore {
     ) -> anyhow::Result<()> {
         let updated_at = now_millis();
         let checkpoint_json = serde_json::to_string(checkpoint)?;
-        sqlx::query(
+        sqlx::query(&format!(
             r#"
-            insert into table_checkpoints (
+            insert into {} (
                 connection_id,
                 source_kind,
                 entity_name,
                 checkpoint_json,
                 updated_at
-            ) values (?, ?, ?, ?, ?)
+            ) values ($1, $2, $3, $4, $5)
             on conflict(connection_id, source_kind, entity_name) do update set
                 checkpoint_json = excluded.checkpoint_json,
                 updated_at = excluded.updated_at
             "#,
-        )
+            self.table("table_checkpoints")
+        ))
         .bind(connection_id)
         .bind(source_kind)
         .bind(entity_name)
@@ -285,20 +291,21 @@ impl SyncStateStore {
         cdc_state: &PostgresCdcState,
     ) -> anyhow::Result<()> {
         let updated_at = now_millis();
-        sqlx::query(
+        sqlx::query(&format!(
             r#"
-            insert into connection_state (
+            insert into {} (
                 connection_id,
                 postgres_cdc_last_lsn,
                 postgres_cdc_slot_name,
                 updated_at
-            ) values (?, ?, ?, ?)
+            ) values ($1, $2, $3, $4)
             on conflict(connection_id) do update set
                 postgres_cdc_last_lsn = excluded.postgres_cdc_last_lsn,
                 postgres_cdc_slot_name = excluded.postgres_cdc_slot_name,
                 updated_at = excluded.updated_at
             "#,
-        )
+            self.table("connection_state")
+        ))
         .bind(connection_id)
         .bind(cdc_state.last_lsn.clone())
         .bind(cdc_state.slot_name.clone())
@@ -315,13 +322,10 @@ impl SyncStateStore {
         source_kind: &str,
         entity_name: &str,
     ) -> anyhow::Result<Option<TableCheckpoint>> {
-        let row = sqlx::query(
-            r#"
-            select checkpoint_json
-            from table_checkpoints
-            where connection_id = ? and source_kind = ? and entity_name = ?
-            "#,
-        )
+        let row = sqlx::query(&format!(
+            "select checkpoint_json from {} where connection_id = $1 and source_kind = $2 and entity_name = $3",
+            self.table("table_checkpoints")
+        ))
         .bind(connection_id)
         .bind(source_kind)
         .bind(entity_name)
@@ -376,129 +380,66 @@ impl SyncStateStore {
     }
 
     async fn init(&self) -> anyhow::Result<()> {
-        sqlx::query(
-            r#"
-            create table if not exists connection_state (
-                connection_id text primary key,
-                last_sync_started_at text,
-                last_sync_finished_at text,
-                last_sync_status text,
-                last_error text,
-                postgres_cdc_last_lsn text,
-                postgres_cdc_slot_name text,
-                updated_at integer not null
-            );
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
+        let mut conn = self.pool.acquire().await?;
+        ensure_schema_exists(&mut conn, &self.schema).await?;
+        ensure_table_exists(&mut conn, &self.schema, "_sqlx_migrations").await?;
+        ensure_table_exists(&mut conn, &self.schema, "connection_state").await?;
+        ensure_table_exists(&mut conn, &self.schema, "table_checkpoints").await?;
+        ensure_table_exists(&mut conn, &self.schema, "connection_locks").await?;
+        Ok(())
+    }
 
-        sqlx::query(
-            r#"
-            create table if not exists table_checkpoints (
-                connection_id text not null,
-                source_kind text not null,
-                entity_name text not null,
-                checkpoint_json text not null,
-                updated_at integer not null,
-                primary key (connection_id, source_kind, entity_name)
-            );
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            create table if not exists connection_locks (
-                connection_id text primary key,
-                owner_id text not null,
-                acquired_at integer not null,
-                heartbeat_at integer not null
-            );
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
+    async fn migrate(&self) -> anyhow::Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        create_schema_if_missing(&mut conn, &self.schema).await?;
+        sqlx::query(&format!("set search_path to {}", quote_ident(&self.schema)))
+            .execute(&mut *conn)
+            .await?;
+        STATE_MIGRATOR.run_direct(&mut *conn).await?;
         Ok(())
     }
 
     async fn try_acquire_lock(&self, connection_id: &str, owner_id: &str) -> anyhow::Result<()> {
-        let mut conn = self.pool.acquire().await?;
-        sqlx::query("begin immediate")
-            .execute(&mut *conn)
-            .await
-            .context("acquiring sqlite write lock")?;
+        let now = now_millis();
+        let stale_before = now - self.lock_ttl.as_millis() as i64;
+        let row = sqlx::query(&format!(
+            r#"
+            insert into {} (
+                connection_id,
+                owner_id,
+                acquired_at,
+                heartbeat_at
+            ) values ($1, $2, $3, $3)
+            on conflict(connection_id) do update set
+                owner_id = excluded.owner_id,
+                acquired_at = excluded.acquired_at,
+                heartbeat_at = excluded.heartbeat_at
+            where {}.owner_id = excluded.owner_id
+               or {}.heartbeat_at < $4
+            returning owner_id
+            "#,
+            self.table("connection_locks"),
+            self.table("connection_locks"),
+            self.table("connection_locks"),
+        ))
+        .bind(connection_id)
+        .bind(owner_id)
+        .bind(now)
+        .bind(stale_before)
+        .fetch_optional(&self.pool)
+        .await?;
 
-        let outcome = async {
-            let existing = sqlx::query(
-                r#"
-                select owner_id, heartbeat_at
-                from connection_locks
-                where connection_id = ?
-                "#,
-            )
-            .bind(connection_id)
-            .fetch_optional(&mut *conn)
-            .await?;
-
-            let now = now_millis();
-            let lock_ttl_ms = self.lock_ttl.as_millis() as i64;
-            if let Some(row) = existing {
-                let current_owner: String = row.try_get("owner_id")?;
-                let heartbeat_at: i64 = row.try_get("heartbeat_at")?;
-                let is_stale = now - heartbeat_at > lock_ttl_ms;
-                if !is_stale && current_owner != owner_id {
-                    anyhow::bail!("connection {} is already locked", connection_id);
-                }
-            }
-
-            sqlx::query(
-                r#"
-                insert into connection_locks (
-                    connection_id,
-                    owner_id,
-                    acquired_at,
-                    heartbeat_at
-                ) values (?, ?, ?, ?)
-                on conflict(connection_id) do update set
-                    owner_id = excluded.owner_id,
-                    acquired_at = excluded.acquired_at,
-                    heartbeat_at = excluded.heartbeat_at
-                "#,
-            )
-            .bind(connection_id)
-            .bind(owner_id)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *conn)
-            .await?;
-
-            anyhow::Ok(())
+        if row.is_none() {
+            anyhow::bail!("connection {} is already locked", connection_id);
         }
-        .await;
-
-        match outcome {
-            Ok(()) => {
-                sqlx::query("commit").execute(&mut *conn).await?;
-                Ok(())
-            }
-            Err(err) => {
-                let _ = sqlx::query("rollback").execute(&mut *conn).await;
-                Err(err)
-            }
-        }
+        Ok(())
     }
 
     async fn heartbeat_lock(&self, connection_id: &str, owner_id: &str) -> anyhow::Result<()> {
-        sqlx::query(
-            r#"
-            update connection_locks
-            set heartbeat_at = ?
-            where connection_id = ? and owner_id = ?
-            "#,
-        )
+        sqlx::query(&format!(
+            "update {} set heartbeat_at = $1 where connection_id = $2 and owner_id = $3",
+            self.table("connection_locks")
+        ))
         .bind(now_millis())
         .bind(connection_id)
         .bind(owner_id)
@@ -508,17 +449,19 @@ impl SyncStateStore {
     }
 
     async fn release_lock(&self, connection_id: &str, owner_id: &str) -> anyhow::Result<()> {
-        sqlx::query(
-            r#"
-            delete from connection_locks
-            where connection_id = ? and owner_id = ?
-            "#,
-        )
+        sqlx::query(&format!(
+            "delete from {} where connection_id = $1 and owner_id = $2",
+            self.table("connection_locks")
+        ))
         .bind(connection_id)
         .bind(owner_id)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    fn table(&self, table_name: &str) -> String {
+        format!("{}.{}", quote_ident(&self.schema), quote_ident(table_name))
     }
 }
 
@@ -622,30 +565,97 @@ impl Drop for ConnectionLease {
             return;
         };
 
-        let stop_tx = self.stop_tx.take();
-        let heartbeat_task = self.heartbeat_task.take();
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    if let Err(error) =
-                        ConnectionLease::cleanup_parts(cleanup, stop_tx, heartbeat_task).await
-                    {
-                        warn!(error = %error, "failed to clean up connection lease on drop");
-                    }
-                });
-            }
-            Err(_) => {
-                warn!(
-                    "dropping connection lease without an active tokio runtime; lock cleanup skipped"
-                );
-            }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let stop_tx = self.stop_tx.take();
+            let heartbeat_task = self.heartbeat_task.take();
+            handle.spawn(async move {
+                if let Err(err) =
+                    ConnectionLease::cleanup_parts(cleanup, stop_tx, heartbeat_task).await
+                {
+                    warn!(error = %err, "failed to release connection lease on drop");
+                }
+            });
+        } else {
+            warn!(
+                "dropping connection lease without an active tokio runtime; lock cleanup skipped"
+            );
         }
     }
 }
 
-fn load_cdc_state_from_row(
-    row: &sqlx::sqlite::SqliteRow,
-) -> anyhow::Result<Option<PostgresCdcState>> {
+fn validate_schema_name(schema: &str) -> anyhow::Result<()> {
+    let mut chars = schema.chars();
+    match chars.next() {
+        Some(ch) if ch.is_ascii_alphabetic() || ch == '_' => {}
+        _ => anyhow::bail!("invalid postgres state schema `{}`", schema),
+    }
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        anyhow::bail!("invalid postgres state schema `{}`", schema);
+    }
+    Ok(())
+}
+
+fn quote_ident(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+async fn ensure_schema_exists(conn: &mut sqlx::PgConnection, schema: &str) -> anyhow::Result<()> {
+    let exists: bool =
+        sqlx::query_scalar("select exists (select 1 from pg_namespace where nspname = $1)")
+            .bind(schema)
+            .fetch_one(&mut *conn)
+            .await?;
+    if !exists {
+        anyhow::bail!("required schema {} does not exist", schema);
+    }
+    Ok(())
+}
+
+async fn create_schema_if_missing(
+    conn: &mut sqlx::PgConnection,
+    schema: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(&format!(
+        "create schema if not exists {}",
+        quote_ident(schema)
+    ))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+async fn ensure_table_exists(
+    conn: &mut sqlx::PgConnection,
+    schema: &str,
+    table: &str,
+) -> anyhow::Result<()> {
+    let exists: bool = sqlx::query_scalar(
+        r#"
+        select exists (
+            select 1
+            from pg_class c
+            join pg_namespace n on n.oid = c.relnamespace
+            where n.nspname = $1
+              and c.relname = $2
+              and c.relkind in ('r', 'p')
+        )
+        "#,
+    )
+    .bind(schema)
+    .bind(table)
+    .fetch_one(&mut *conn)
+    .await?;
+    if !exists {
+        anyhow::bail!(
+            "required table {}.{} does not exist; run `cdsync migrate --config ...` first",
+            schema,
+            table
+        );
+    }
+    Ok(())
+}
+
+fn load_cdc_state_from_row(row: &PgRow) -> anyhow::Result<Option<PostgresCdcState>> {
     let last_lsn: Option<String> = row.try_get("postgres_cdc_last_lsn")?;
     let slot_name: Option<String> = row.try_get("postgres_cdc_slot_name")?;
     if last_lsn.is_none() && slot_name.is_none() {
@@ -683,11 +693,21 @@ fn max_updated_at(current: Option<i64>, next: i64) -> Option<i64> {
 mod tests {
     use super::*;
 
+    fn test_state_config() -> Option<StateConfig> {
+        let url = std::env::var("CDSYNC_E2E_PG_URL").ok()?;
+        Some(StateConfig {
+            url,
+            schema: Some(format!("cdsync_state_test_{}", Uuid::new_v4().simple())),
+        })
+    }
+
     #[tokio::test]
     async fn state_store_round_trips_connection_state() -> anyhow::Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let path = temp_dir.path().join("state.db");
-        let store = SyncStateStore::open(&path).await?;
+        let Some(config) = test_state_config() else {
+            return Ok(());
+        };
+        SyncStateStore::migrate_with_config(&config).await?;
+        let store = SyncStateStore::open_with_config(&config).await?;
         let handle = store.handle("app");
 
         let mut state = ConnectionState {
@@ -733,9 +753,11 @@ mod tests {
 
     #[tokio::test]
     async fn connection_locks_block_second_owner() -> anyhow::Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let path = temp_dir.path().join("state.db");
-        let store = SyncStateStore::open(&path).await?;
+        let Some(config) = test_state_config() else {
+            return Ok(());
+        };
+        SyncStateStore::migrate_with_config(&config).await?;
+        let store = SyncStateStore::open_with_config(&config).await?;
 
         let lease = store.acquire_connection_lock("app").await?;
         let second = store.acquire_connection_lock("app").await;
@@ -746,9 +768,11 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_connection_lease_releases_lock() -> anyhow::Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let path = temp_dir.path().join("state.db");
-        let store = SyncStateStore::open(&path).await?;
+        let Some(config) = test_state_config() else {
+            return Ok(());
+        };
+        SyncStateStore::migrate_with_config(&config).await?;
+        let store = SyncStateStore::open_with_config(&config).await?;
 
         {
             let _lease = store.acquire_connection_lock("app").await?;

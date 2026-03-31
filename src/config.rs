@@ -7,6 +7,7 @@ pub struct Config {
     pub state: StateConfig,
     pub metadata: Option<MetadataConfig>,
     pub logging: Option<LoggingConfig>,
+    pub admin_api: Option<AdminApiConfig>,
     pub observability: Option<ObservabilityConfig>,
     pub sync: Option<SyncConfig>,
     pub stats: Option<StatsConfig>,
@@ -76,6 +77,18 @@ pub struct LoggingConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminApiConfig {
+    pub enabled: Option<bool>,
+    pub bind: Option<String>,
+}
+
+impl AdminApiConfig {
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservabilityConfig {
     pub service_name: Option<String>,
     pub otlp_traces_endpoint: Option<String>,
@@ -86,12 +99,26 @@ pub struct ObservabilityConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateConfig {
-    pub path: PathBuf,
+    pub url: String,
+    pub schema: Option<String>,
+}
+
+impl StateConfig {
+    pub fn schema_name(&self) -> &str {
+        self.schema.as_deref().unwrap_or("cdsync_state")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsConfig {
-    pub path: PathBuf,
+    pub url: Option<String>,
+    pub schema: Option<String>,
+}
+
+impl StatsConfig {
+    pub fn schema_name(&self) -> &str {
+        self.schema.as_deref().unwrap_or("cdsync_stats")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,6 +385,8 @@ pub struct BigQueryConfig {
     pub service_account_key: Option<String>,
     pub partition_by_synced_at: Option<bool>,
     pub storage_write_enabled: Option<bool>,
+    pub batch_load_bucket: Option<String>,
+    pub batch_load_prefix: Option<String>,
     pub emulator_http: Option<String>,
     pub emulator_grpc: Option<String>,
 }
@@ -371,7 +400,8 @@ pub struct TemplateConfig {
 const DEFAULT_TEMPLATE: &str = r#"# CDSync configuration (YAML)
 
 state:
-  path: "./cdsync_state.db"
+  url: "postgres://user:pass@host:5432/db"
+  schema: "cdsync_state"
 
 metadata:
   synced_at_column: "_cdsync_synced_at"
@@ -380,6 +410,10 @@ metadata:
 logging:
   level: "info"
   json: false
+
+admin_api:
+  enabled: false
+  bind: "127.0.0.1:8080"
 
 observability:
   service_name: "cdsync"
@@ -391,10 +425,14 @@ sync:
   default_batch_size: 10000
   max_retries: 5
   retry_backoff_ms: 1000
+  # Polling uses this for per-table parallelism; Postgres CDC uses it to bound
+  # in-flight snapshot batch writes during initial copy/resync.
   max_concurrency: 4
 
 stats:
-  path: "./cdsync_stats.db"
+  # If omitted, reporting is disabled.
+  url: "postgres://user:pass@host:5432/db"
+  schema: "cdsync_stats"
 
 connections:
   - id: "app"
@@ -438,6 +476,8 @@ connections:
       service_account_key_path: "/path/to/service-account.json"
       partition_by_synced_at: true
       storage_write_enabled: true
+      # batch_load_bucket: "my-cdsync-loads"
+      # batch_load_prefix: "staging/app"
       # emulator_http: "http://localhost:9050"
       # emulator_grpc: "localhost:9051"
 
@@ -470,6 +510,8 @@ connections:
       service_account_key_path: "/path/to/service-account.json"
       partition_by_synced_at: true
       storage_write_enabled: true
+      # batch_load_bucket: "my-cdsync-loads"
+      # batch_load_prefix: "staging/salesforce"
       # emulator_http: "http://localhost:9050"
       # emulator_grpc: "localhost:9051"
 "#;
@@ -482,7 +524,7 @@ mod tests {
     fn validate_requires_publication_when_cdc_enabled() {
         let raw = r#"
 state:
-  path: "./state.json"
+  url: "postgres://user:pass@host:5432/db"
 connections:
   - id: "app"
     source:
@@ -505,7 +547,7 @@ connections:
     fn validate_allows_cdc_disabled_without_publication() {
         let raw = r#"
 state:
-  path: "./state.json"
+  url: "postgres://user:pass@host:5432/db"
 connections:
   - id: "app"
     source:
@@ -528,7 +570,7 @@ connections:
     fn metadata_columns_override_defaults() {
         let raw = r#"
 state:
-  path: "./state.db"
+  url: "postgres://user:pass@host:5432/db"
 metadata:
   synced_at_column: "_synced_custom"
   deleted_at_column: "_deleted_custom"

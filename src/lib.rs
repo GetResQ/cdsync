@@ -1,3 +1,4 @@
+pub mod admin_api;
 pub mod config;
 pub mod destinations;
 pub mod dotenv;
@@ -6,4 +7,5 @@ pub mod sources;
 pub mod state;
 pub mod stats;
 pub mod telemetry;
+pub mod tls;
 pub mod types;

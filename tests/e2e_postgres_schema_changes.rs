@@ -95,6 +95,8 @@ async fn e2e_schema_addition_auto_alters_destination() -> Result<()> {
         service_account_key: None,
         partition_by_synced_at: Some(false),
         storage_write_enabled: Some(true),
+        batch_load_bucket: None,
+        batch_load_prefix: None,
         emulator_http: Some(bq_http.clone()),
         emulator_grpc: Some(bq_grpc.clone()),
     };
@@ -260,6 +262,8 @@ async fn e2e_schema_change_fail_fast() -> Result<()> {
         service_account_key: None,
         partition_by_synced_at: Some(false),
         storage_write_enabled: Some(true),
+        batch_load_bucket: None,
+        batch_load_prefix: None,
         emulator_http: Some(bq_http),
         emulator_grpc: Some(bq_grpc),
     };
@@ -402,6 +406,8 @@ async fn e2e_schema_removal_resyncs_table() -> Result<()> {
         service_account_key: None,
         partition_by_synced_at: Some(false),
         storage_write_enabled: Some(true),
+        batch_load_bucket: None,
+        batch_load_prefix: None,
         emulator_http: Some(bq_http.clone()),
         emulator_grpc: Some(bq_grpc),
     };
