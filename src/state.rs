@@ -344,6 +344,40 @@ impl SyncStateStore {
         .transpose()
     }
 
+    pub async fn load_all_table_checkpoints(
+        &self,
+        connection_id: &str,
+        source_kind: &str,
+    ) -> anyhow::Result<HashMap<String, TableCheckpoint>> {
+        let rows = sqlx::query(&format!(
+            r#"
+            select entity_name, checkpoint_json
+            from {}
+            where connection_id = $1 and source_kind = $2
+            "#,
+            self.table("table_checkpoints")
+        ))
+        .bind(connection_id)
+        .bind(source_kind)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut checkpoints = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let entity_name: String = row.try_get("entity_name")?;
+            let checkpoint_json: String = row.try_get("checkpoint_json")?;
+            let checkpoint: TableCheckpoint =
+                serde_json::from_str(&checkpoint_json).with_context(|| {
+                    format!(
+                        "parsing checkpoint for {}:{}:{}",
+                        connection_id, source_kind, entity_name
+                    )
+                })?;
+            checkpoints.insert(entity_name, checkpoint);
+        }
+        Ok(checkpoints)
+    }
+
     pub async fn acquire_connection_lock(
         &self,
         connection_id: &str,
@@ -530,6 +564,15 @@ impl StateHandle {
             .load_table_checkpoint(&self.connection_id, "salesforce", object_name)
             .await
     }
+
+    pub async fn load_all_postgres_checkpoints(
+        &self,
+    ) -> anyhow::Result<HashMap<String, TableCheckpoint>> {
+        self.store
+            .load_all_table_checkpoints(&self.connection_id, "postgres")
+            .await
+    }
+
 }
 
 impl ConnectionLease {

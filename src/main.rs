@@ -270,6 +270,25 @@ async fn load_latest_salesforce_checkpoint(
     }
 }
 
+async fn refresh_postgres_checkpoints_from_store(
+    state_handle: &crate::state::StateHandle,
+    state: &mut ConnectionState,
+) {
+    match state_handle.load_all_postgres_checkpoints().await {
+        Ok(checkpoints) => {
+            if !checkpoints.is_empty() {
+                state.postgres = checkpoints;
+            }
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to refresh persisted postgres checkpoints before final state save"
+            );
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tls::install_rustls_provider();
@@ -529,6 +548,7 @@ async fn cmd_sync(request: SyncCommandRequest) -> Result<()> {
                 .unwrap_or("unknown"),
             duration_ms,
         );
+        refresh_postgres_checkpoints_from_store(&state_handle, connection_state).await;
         state_handle.save_connection_state(connection_state).await?;
         lease.release().await?;
 

@@ -380,6 +380,12 @@ async fn progress(
 ) -> Result<Json<ProgressResponse>, AdminApiError> {
     let sync_state = state.state_store.load_state().await?;
     let connection_state = sync_state.connections.get(&connection_id).cloned();
+    let config = state
+        .cfg
+        .connections
+        .iter()
+        .find(|connection| connection.id == connection_id)
+        .context("connection not found")?;
     let (current_run, run_tables) = if let Some(stats_db) = &state.stats_db {
         let runs = stats_db.recent_runs(Some(&connection_id), 1).await?;
         if let Some(run) = runs.into_iter().next() {
@@ -394,7 +400,8 @@ async fn progress(
 
     let mut table_names = std::collections::BTreeSet::new();
     if let Some(state) = &connection_state {
-        table_names.extend(state.postgres.keys().cloned());
+        let checkpoint_map = active_checkpoint_map(state, &config.source);
+        table_names.extend(checkpoint_map.keys().cloned());
     }
     table_names.extend(run_tables.iter().map(|table| table.table_name.clone()));
 
@@ -406,9 +413,11 @@ async fn progress(
     let tables = table_names
         .into_iter()
         .map(|table_name| TableProgress {
-            checkpoint: connection_state
-                .as_ref()
-                .and_then(|state| state.postgres.get(&table_name).cloned()),
+            checkpoint: connection_state.as_ref().and_then(|state| {
+                active_checkpoint_map(state, &config.source)
+                    .get(&table_name)
+                    .cloned()
+            }),
             stats: run_table_map.get(&table_name).cloned(),
             table_name,
         })
@@ -420,6 +429,16 @@ async fn progress(
         current_run,
         tables,
     }))
+}
+
+fn active_checkpoint_map<'a>(
+    state: &'a ConnectionState,
+    source: &SourceConfig,
+) -> &'a std::collections::HashMap<String, TableCheckpoint> {
+    match source {
+        SourceConfig::Postgres(_) => &state.postgres,
+        SourceConfig::Salesforce(_) => &state.salesforce,
+    }
 }
 
 fn scrub_config(cfg: &Config) -> ScrubbedConfig {
@@ -548,6 +567,7 @@ fn scrub_url(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::TableCheckpoint;
 
     #[test]
     fn scrub_observability_config_redacts_header_values() {
@@ -571,6 +591,43 @@ mod tests {
                 .and_then(|headers| headers.get("authorization"))
                 .map(String::as_str),
             Some("***")
+        );
+    }
+
+    #[test]
+    fn active_checkpoint_map_uses_salesforce_state_for_salesforce_connections() {
+        let mut state = ConnectionState::default();
+        state.salesforce.insert(
+            "Account".to_string(),
+            TableCheckpoint {
+                last_primary_key: Some("001".to_string()),
+                ..Default::default()
+            },
+        );
+        let source = SourceConfig::Salesforce(crate::config::SalesforceConfig {
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string(),
+            refresh_token: "refresh".to_string(),
+            login_url: None,
+            instance_url: None,
+            api_version: None,
+            objects: Some(vec![crate::config::SalesforceObjectConfig {
+                name: "Account".to_string(),
+                primary_key: Some("Id".to_string()),
+                fields: None,
+                soft_delete: Some(true),
+            }]),
+            object_selection: None,
+            polling_interval_seconds: None,
+            rate_limit: None,
+        });
+
+        let checkpoints = active_checkpoint_map(&state, &source);
+        assert_eq!(
+            checkpoints
+                .get("Account")
+                .and_then(|checkpoint| checkpoint.last_primary_key.as_deref()),
+            Some("001")
         );
     }
 }
