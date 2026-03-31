@@ -1,20 +1,20 @@
 # Mission
 
-Mission: Start hardening the WAL pipeline/backpressure path by making the CDC commit queue and backpressure behavior explicitly observable instead of only implicitly bounded in code.
+Mission: Close the next live-progress persistence test gaps by proving that periodic run-stat flushing and snapshot checkpoint writes actually persist observable state during an in-flight run.
 
 ## Done Criteria
 
-1. CDC runtime emits explicit metrics for pending events and commit queue/in-flight depth.
-2. Backpressure waits are recorded so operators can tell when BigQuery/apply throughput is throttling WAL consumption.
-3. The change stays bounded to observability/runtime signaling and does not redesign the whole CDC engine in one pass.
+1. There is coverage for periodic run-stat persistence to the stats database.
+2. There is coverage for snapshot checkpoint writes during snapshot progress, not just at final completion.
+3. The tests run in the normal suite and keep formatting, tests, and clippy clean.
 
 ## Guardrails
 
-- Preserve commit ordering and existing correctness guarantees.
-- Do not change the existing bounded-queue behavior unless there is a clear correctness reason.
+- Keep the work bounded to tests and the minimum helper seams needed to make those tests reliable.
+- Do not weaken the existing persistence behavior just to make tests easier.
 - No compiler warnings, no clippy warnings, no broken tests.
 
 ## Critical Learnings
 
-- Decision: The extracted `cdc_runtime.rs` is now the cleanest seam for queue/backpressure instrumentation.
-- Constraint: We already have bounded queues and watermark-based advancement; the immediate gap is visibility, not the absence of any queueing at all.
+- Decision: Admin API route coverage now exists through in-process server tests, so the next highest-value test work is live-progress persistence.
+- Constraint: Persistence tests are easiest to write where the runtime already exposes stable helper seams, rather than trying to drive a full external integration path for every case.

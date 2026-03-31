@@ -833,7 +833,7 @@ pub(super) async fn release_exported_snapshot_slot(
     Ok(())
 }
 
-async fn save_snapshot_progress(
+pub(super) async fn save_snapshot_progress(
     checkpoint_state: &Arc<Mutex<TableCheckpoint>>,
     table_name: &str,
     chunk: Option<SnapshotChunkRange>,

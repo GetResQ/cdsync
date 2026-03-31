@@ -1,13 +1,17 @@
+#[cfg(test)]
+mod route_tests;
+
 use crate::config::{
     AdminApiConfig, BigQueryConfig, Config, ConnectionConfig, DestinationConfig, LoggingConfig,
     MetadataConfig, ObservabilityConfig, PostgresConfig, SalesforceConfig, SourceConfig,
     SyncConfig,
 };
 use crate::runner::ShutdownSignal;
-use crate::state::{ConnectionState, SyncStateStore};
+use crate::state::{ConnectionState, SyncState, SyncStateStore};
 use crate::stats::{RunSummary, StatsDb, TableStatsSnapshot};
 use crate::types::TableCheckpoint;
 use anyhow::Context;
+use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -24,11 +28,58 @@ use url::Url;
 #[derive(Clone)]
 pub struct AdminApiState {
     cfg: Arc<Config>,
-    state_store: SyncStateStore,
-    stats_db: Option<StatsDb>,
+    state_store: Arc<dyn AdminStateBackend>,
+    stats_db: Option<Arc<dyn AdminStatsBackend>>,
     started_at: DateTime<Utc>,
     mode: String,
     connection_id: String,
+}
+
+#[async_trait]
+trait AdminStateBackend: Send + Sync {
+    async fn ping(&self) -> anyhow::Result<()>;
+    async fn load_state(&self) -> anyhow::Result<SyncState>;
+}
+
+#[async_trait]
+trait AdminStatsBackend: Send + Sync {
+    async fn ping(&self) -> anyhow::Result<()>;
+    async fn recent_runs(
+        &self,
+        connection_id: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<RunSummary>>;
+    async fn run_tables(&self, run_id: &str) -> anyhow::Result<Vec<TableStatsSnapshot>>;
+}
+
+#[async_trait]
+impl AdminStateBackend for SyncStateStore {
+    async fn ping(&self) -> anyhow::Result<()> {
+        SyncStateStore::ping(self).await
+    }
+
+    async fn load_state(&self) -> anyhow::Result<SyncState> {
+        SyncStateStore::load_state(self).await
+    }
+}
+
+#[async_trait]
+impl AdminStatsBackend for StatsDb {
+    async fn ping(&self) -> anyhow::Result<()> {
+        StatsDb::ping(self).await
+    }
+
+    async fn recent_runs(
+        &self,
+        connection_id: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<RunSummary>> {
+        StatsDb::recent_runs(self, connection_id, limit).await
+    }
+
+    async fn run_tables(&self, run_id: &str) -> anyhow::Result<Vec<TableStatsSnapshot>> {
+        StatsDb::run_tables(self, run_id).await
+    }
 }
 
 #[derive(Debug)]
@@ -238,9 +289,10 @@ pub async fn spawn_admin_api(
         .parse::<SocketAddr>()
         .with_context(|| "invalid admin_api.bind")?;
 
-    let state_store = SyncStateStore::open_with_config(&cfg.state).await?;
+    let state_store: Arc<dyn AdminStateBackend> =
+        Arc::new(SyncStateStore::open_with_config(&cfg.state).await?);
     let stats_db = if let Some(stats_cfg) = &cfg.stats {
-        Some(StatsDb::new(stats_cfg, &cfg.state.url).await?)
+        Some(Arc::new(StatsDb::new(stats_cfg, &cfg.state.url).await?) as Arc<dyn AdminStatsBackend>)
     } else {
         None
     };
@@ -254,17 +306,7 @@ pub async fn spawn_admin_api(
         connection_id: connection_id.to_string(),
     };
 
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
-        .route("/v1/status", get(status))
-        .route("/v1/config", get(config))
-        .route("/v1/connections", get(connections))
-        .route("/v1/connections/{id}", get(connection))
-        .route("/v1/connections/{id}/checkpoints", get(checkpoints))
-        .route("/v1/connections/{id}/progress", get(progress))
-        .route("/v1/connections/{id}/runs", get(runs))
-        .with_state(state);
+    let app = router(state);
 
     let listener = TcpListener::bind(bind).await?;
     let mut shutdown = shutdown;
@@ -278,6 +320,20 @@ pub async fn spawn_admin_api(
     });
 
     Ok(Some(handle))
+}
+
+fn router(state: AdminApiState) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/v1/status", get(status))
+        .route("/v1/config", get(config))
+        .route("/v1/connections", get(connections))
+        .route("/v1/connections/{id}", get(connection))
+        .route("/v1/connections/{id}/checkpoints", get(checkpoints))
+        .route("/v1/connections/{id}/progress", get(progress))
+        .route("/v1/connections/{id}/runs", get(runs))
+        .with_state(state)
 }
 
 async fn healthz() -> Json<HealthResponse> {

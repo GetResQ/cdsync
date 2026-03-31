@@ -1,4 +1,8 @@
 use super::*;
+use super::snapshot_sync::save_snapshot_progress;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use uuid::Uuid;
 
 #[test]
 fn maps_pg_types_to_internal_types() {
@@ -349,4 +353,83 @@ fn build_select_columns_casts_string_columns_to_text() {
         build_select_columns(&schema),
         "\"id\", \"search_vector\"::text as \"search_vector\""
     );
+}
+
+fn test_state_config() -> Option<crate::config::StateConfig> {
+    let url = std::env::var("CDSYNC_E2E_PG_URL").ok()?;
+    Some(crate::config::StateConfig {
+        url,
+        schema: Some(format!("cdsync_state_snapshot_test_{}", Uuid::new_v4().simple())),
+    })
+}
+
+#[tokio::test]
+async fn save_snapshot_progress_persists_checkpoint_updates() -> anyhow::Result<()> {
+    let Some(config) = test_state_config() else {
+        return Ok(());
+    };
+    crate::state::SyncStateStore::migrate_with_config(&config).await?;
+    let store = crate::state::SyncStateStore::open_with_config(&config).await?;
+    let handle = store.handle("app");
+
+    let checkpoint_state = Arc::new(Mutex::new(TableCheckpoint {
+        snapshot_start_lsn: Some("0/ABC".to_string()),
+        snapshot_chunks: vec![SnapshotChunkCheckpoint {
+            start_primary_key: Some("1".to_string()),
+            end_primary_key: Some("10".to_string()),
+            last_primary_key: None,
+            complete: false,
+        }],
+        ..Default::default()
+    }));
+
+    save_snapshot_progress(
+        &checkpoint_state,
+        "public.accounts",
+        Some(SnapshotChunkRange {
+            start_pk: 1,
+            end_pk: 10,
+        }),
+        Some("6".to_string()),
+        false,
+        Some(&handle),
+    )
+    .await?;
+
+    let checkpoint = handle
+        .load_postgres_checkpoint("public.accounts")
+        .await?
+        .expect("checkpoint persisted");
+    assert_eq!(checkpoint.snapshot_start_lsn.as_deref(), Some("0/ABC"));
+    assert_eq!(checkpoint.snapshot_chunks.len(), 1);
+    assert_eq!(
+        checkpoint.snapshot_chunks[0].last_primary_key.as_deref(),
+        Some("6")
+    );
+    assert!(!checkpoint.snapshot_chunks[0].complete);
+    assert!(checkpoint.last_synced_at.is_some());
+
+    save_snapshot_progress(
+        &checkpoint_state,
+        "public.accounts",
+        Some(SnapshotChunkRange {
+            start_pk: 1,
+            end_pk: 10,
+        }),
+        Some("10".to_string()),
+        true,
+        Some(&handle),
+    )
+    .await?;
+
+    let checkpoint = handle
+        .load_postgres_checkpoint("public.accounts")
+        .await?
+        .expect("checkpoint persisted");
+    assert_eq!(
+        checkpoint.snapshot_chunks[0].last_primary_key.as_deref(),
+        Some("10")
+    );
+    assert!(checkpoint.snapshot_chunks[0].complete);
+    Ok(())
 }

@@ -66,6 +66,8 @@ mod reconcile_tests {
 
 mod sync_selection_tests {
     use super::*;
+    use crate::config::StatsConfig;
+    use tokio::time::{Duration, sleep};
 
     fn test_connection(id: &str, enabled: Option<bool>) -> crate::config::ConnectionConfig {
         crate::config::ConnectionConfig {
@@ -119,6 +121,18 @@ mod sync_selection_tests {
         std::env::var("CDSYNC_TEST_STATE_URL")
             .ok()
             .map(|url| crate::config::StateConfig { url, schema: None })
+    }
+
+    fn test_stats_config() -> Option<(String, StatsConfig)> {
+        let url = std::env::var("CDSYNC_E2E_PG_URL").ok()?;
+        let config = StatsConfig {
+            url: Some(url.clone()),
+            schema: Some(format!(
+                "cdsync_stats_flush_test_{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+        };
+        Some((url, config))
     }
 
     #[test]
@@ -236,6 +250,39 @@ mod sync_selection_tests {
                 .and_then(|checkpoint| checkpoint.last_primary_key.as_deref()),
             Some("99")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn periodic_stats_flush_persists_live_run_progress() -> anyhow::Result<()> {
+        let Some((default_url, config)) = test_stats_config() else {
+            return Ok(());
+        };
+        StatsDb::migrate_with_config(&config, &default_url).await?;
+        let db = StatsDb::new(&config, &default_url).await?;
+        let handle = StatsHandle::new("app");
+        handle.record_extract("public.accounts", 7, 11).await;
+        handle.record_load("public.accounts", 7, 7, 0, 13).await;
+
+        let flush = spawn_stats_flush_task_with_interval(
+            db.clone(),
+            handle.clone(),
+            Duration::from_millis(10),
+        );
+        sleep(Duration::from_millis(40)).await;
+        stop_stats_flush_task(Some(flush)).await;
+
+        let runs = db.recent_runs(Some("app"), 5).await?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status.as_deref(), Some("running"));
+        assert_eq!(runs[0].rows_read, 7);
+        assert_eq!(runs[0].rows_written, 7);
+
+        let tables = db.run_tables(&runs[0].run_id).await?;
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].table_name, "public.accounts");
+        assert_eq!(tables[0].rows_read, 7);
+        assert_eq!(tables[0].rows_upserted, 7);
         Ok(())
     }
 }

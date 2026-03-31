@@ -161,11 +161,19 @@ fn select_sync_connections<'a>(
 }
 
 fn spawn_stats_flush_task(db: StatsDb, handle: StatsHandle) -> StatsFlushHandle {
+    spawn_stats_flush_task_with_interval(db, handle, LIVE_STATS_FLUSH_INTERVAL)
+}
+
+fn spawn_stats_flush_task_with_interval(
+    db: StatsDb,
+    handle: StatsHandle,
+    interval: Duration,
+) -> StatsFlushHandle {
     let (stop_tx, mut stop_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(LIVE_STATS_FLUSH_INTERVAL) => {
+                _ = tokio::time::sleep(interval) => {
                     if let Err(err) = db.persist_run(&handle).await {
                         warn!(error = %err, "failed to persist live run stats");
                     }
