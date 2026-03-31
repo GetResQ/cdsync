@@ -199,7 +199,9 @@ fn build_storage_write_descriptor(schema: &TableSchema) -> DescriptorProto {
 
 fn storage_write_field_type(data_type: DataType) -> Type {
     match data_type {
-        DataType::String | DataType::Date | DataType::Numeric | DataType::Json => Type::String,
+        DataType::String | DataType::Date | DataType::Time | DataType::Numeric | DataType::Json => {
+            Type::String
+        }
         DataType::Int64 => Type::Int64,
         DataType::Float64 => Type::Double,
         DataType::Bool => Type::Bool,
@@ -259,7 +261,7 @@ fn anyvalue_to_storage_write_value(
         return Ok(None);
     }
     let reflect_value = match data_type {
-        DataType::String | DataType::Date | DataType::Numeric | DataType::Json => {
+        DataType::String | DataType::Date | DataType::Time | DataType::Numeric | DataType::Json => {
             ReflectValue::String(anyvalue_to_owned_string(value)?)
         }
         DataType::Int64 => ReflectValue::I64(anyvalue_to_i64(value)?),

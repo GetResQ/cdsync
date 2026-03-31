@@ -22,6 +22,10 @@ fn maps_pg_types_to_internal_types() {
         pg_type_to_data_type_from_type(&etl::types::Type::TIMESTAMPTZ),
         DataType::Timestamp
     );
+    assert_eq!(
+        pg_type_to_data_type_from_type(&etl::types::Type::TIME),
+        DataType::Time
+    );
 }
 
 #[test]
