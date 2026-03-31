@@ -1364,6 +1364,7 @@ mod sync_selection_tests {
         let Some(config) = test_state_config() else {
             return Ok(());
         };
+        SyncStateStore::migrate_with_config(&config).await?;
         let store = SyncStateStore::open_with_config(&config).await?;
         let handle = store.handle("app");
         let persisted = TableCheckpoint {
@@ -1389,6 +1390,7 @@ mod sync_selection_tests {
         let Some(config) = test_state_config() else {
             return Ok(());
         };
+        SyncStateStore::migrate_with_config(&config).await?;
         let store = SyncStateStore::open_with_config(&config).await?;
         let handle = store.handle("app");
         let persisted = TableCheckpoint {
@@ -1406,6 +1408,45 @@ mod sync_selection_tests {
         let loaded = load_latest_salesforce_checkpoint(&handle, "Account", &fallback).await;
 
         assert_eq!(loaded.last_primary_key.as_deref(), Some("42"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_postgres_checkpoints_from_store_overwrites_stale_in_memory_state(
+    ) -> anyhow::Result<()> {
+        let Some(config) = test_state_config() else {
+            return Ok(());
+        };
+        SyncStateStore::migrate_with_config(&config).await?;
+        let store = SyncStateStore::open_with_config(&config).await?;
+        let handle = store.handle("app");
+
+        let persisted = TableCheckpoint {
+            last_primary_key: Some("99".to_string()),
+            ..Default::default()
+        };
+        handle
+            .save_postgres_checkpoint("public.accounts", &persisted)
+            .await?;
+
+        let mut state = ConnectionState::default();
+        state.postgres.insert(
+            "public.accounts".to_string(),
+            TableCheckpoint {
+                last_primary_key: Some("1".to_string()),
+                ..Default::default()
+            },
+        );
+
+        refresh_postgres_checkpoints_from_store(&handle, &mut state).await;
+
+        assert_eq!(
+            state
+                .postgres
+                .get("public.accounts")
+                .and_then(|checkpoint| checkpoint.last_primary_key.as_deref()),
+            Some("99")
+        );
         Ok(())
     }
 }
