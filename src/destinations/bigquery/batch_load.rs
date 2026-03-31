@@ -9,7 +9,6 @@ use polars::prelude::{
 };
 use token_source::TokenSource;
 use tokio::time::sleep;
-use tracing::warn;
 use uuid::Uuid;
 
 use gcloud_bigquery::http::job::get::GetJobRequest;
@@ -18,14 +17,13 @@ use gcloud_bigquery::http::job::{
     JobType, WriteDisposition,
 };
 use gcloud_bigquery::http::table::{
-    ParquetOptions, SourceFormat, TableReference, TableSchema as BqTableSchema,
+    DecimalTargetType, ParquetOptions, SourceFormat, TableReference, TableSchema as BqTableSchema,
 };
 
 use super::BigQueryDestination;
 use crate::destinations::bigquery::values::{
     anyvalue_to_bool, anyvalue_to_bytes, anyvalue_to_date_days, anyvalue_to_f64, anyvalue_to_i64,
     anyvalue_to_owned_string, anyvalue_to_timestamp_micros, bq_fields_from_schema,
-    dataframe_to_json_rows,
 };
 use crate::destinations::with_metadata_schema;
 use crate::types::{ColumnSchema, DataType, TableSchema};
@@ -55,38 +53,24 @@ impl BigQueryDestination {
         };
 
         let schema = with_metadata_schema(schema, &self.metadata);
-        let format = if parquet_batch_load_supported(&schema) {
-            BatchLoadFormat::Parquet
-        } else {
-            warn!(
-                table = %table_id,
-                "parquet batch load unsupported for schema; falling back to ndjson"
-            );
-            BatchLoadFormat::Ndjson
-        };
-
         let object_name = batch_load_object_name(
             self.config.batch_load_prefix.as_deref(),
             table_id,
-            format.file_extension(),
+            PARQUET_FILE_EXTENSION,
         );
         let object_uri = format!("gs://{}/{}", bucket, object_name);
-        let body = match format {
-            BatchLoadFormat::Ndjson => dataframe_to_ndjson_bytes(frame)?,
-            BatchLoadFormat::Parquet => dataframe_to_parquet_bytes(frame, &schema)?,
-        };
+        let body = dataframe_to_parquet_bytes(frame, &schema)?;
         self.upload_batch_load_object(
             token_source,
             bucket,
             &object_name,
-            format.content_type(),
+            PARQUET_CONTENT_TYPE,
             body,
         )
         .await
         .with_context(|| format!("uploading batch load object {}", object_uri))?;
 
-        self.run_load_job(table_id, &schema, &object_uri, format)
-            .await?;
+        self.run_load_job(table_id, &schema, &object_uri).await?;
         Ok(true)
     }
 
@@ -127,7 +111,6 @@ impl BigQueryDestination {
         table_id: &str,
         schema: &TableSchema,
         source_uri: &str,
-        format: BatchLoadFormat,
     ) -> Result<()> {
         let job_id = format!("cdsync_load_{}", Uuid::new_v4().simple());
         let location = self.config.location.clone();
@@ -151,14 +134,16 @@ impl BigQueryDestination {
                     },
                     create_disposition: Some(CreateDisposition::CreateIfNeeded),
                     write_disposition: Some(WriteDisposition::WriteAppend),
-                    source_format: Some(format.source_format()),
+                    source_format: Some(SourceFormat::Parquet),
                     max_bad_records: Some(0),
                     autodetect: Some(false),
                     ignore_unknown_values: Some(false),
-                    parquet_options: match format {
-                        BatchLoadFormat::Parquet => Some(ParquetOptions::default()),
-                        BatchLoadFormat::Ndjson => None,
-                    },
+                    decimal_target_types: Some(vec![
+                        DecimalTargetType::Numeric,
+                        DecimalTargetType::Bignumeric,
+                        DecimalTargetType::String,
+                    ]),
+                    parquet_options: Some(ParquetOptions::default()),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -210,11 +195,8 @@ impl BigQueryDestination {
     }
 }
 
-#[derive(Clone, Copy)]
-enum BatchLoadFormat {
-    Ndjson,
-    Parquet,
-}
+const PARQUET_FILE_EXTENSION: &str = "parquet";
+const PARQUET_CONTENT_TYPE: &str = "application/vnd.apache.parquet";
 
 fn batch_load_object_name(prefix: Option<&str>, table_id: &str, extension: &str) -> String {
     let base = format!(
@@ -229,39 +211,6 @@ fn batch_load_object_name(prefix: Option<&str>, table_id: &str, extension: &str)
     }
 }
 
-impl BatchLoadFormat {
-    fn file_extension(self) -> &'static str {
-        match self {
-            Self::Ndjson => "ndjson",
-            Self::Parquet => "parquet",
-        }
-    }
-
-    fn content_type(self) -> &'static str {
-        match self {
-            Self::Ndjson => "application/x-ndjson",
-            Self::Parquet => "application/vnd.apache.parquet",
-        }
-    }
-
-    fn source_format(self) -> SourceFormat {
-        match self {
-            Self::Ndjson => SourceFormat::NewlineDelimitedJson,
-            Self::Parquet => SourceFormat::Parquet,
-        }
-    }
-}
-
-fn dataframe_to_ndjson_bytes(frame: &DataFrame) -> Result<Vec<u8>> {
-    let rows = dataframe_to_json_rows(frame)?;
-    let mut out = Vec::new();
-    for row in rows {
-        serde_json::to_writer(&mut out, &row)?;
-        out.push(b'\n');
-    }
-    Ok(out)
-}
-
 fn dataframe_to_parquet_bytes(frame: &DataFrame, schema: &TableSchema) -> Result<Vec<u8>> {
     let mut parquet_frame = parquet_batch_load_frame(frame, schema)?;
     let mut cursor = Cursor::new(Vec::new());
@@ -270,13 +219,6 @@ fn dataframe_to_parquet_bytes(frame: &DataFrame, schema: &TableSchema) -> Result
         .finish(&mut parquet_frame)
         .context("writing parquet batch load payload")?;
     Ok(cursor.into_inner())
-}
-
-fn parquet_batch_load_supported(schema: &TableSchema) -> bool {
-    schema
-        .columns
-        .iter()
-        .all(|column| !matches!(column.data_type, DataType::Numeric | DataType::Json))
 }
 
 fn parquet_batch_load_frame(frame: &DataFrame, schema: &TableSchema) -> Result<DataFrame> {
@@ -337,12 +279,23 @@ fn parquet_batch_load_series(series: &Series, column: &ColumnSchema) -> Result<S
             let refs: Vec<Option<&[u8]>> = values.iter().map(|value| value.as_deref()).collect();
             Ok(BinaryChunked::from_slice_options(column.name.as_str().into(), &refs).into_series())
         }
-        DataType::Numeric | DataType::Json => anyhow::bail!(
-            "parquet batch load does not support {:?} columns yet: {}",
-            column.data_type,
-            column.name
-        ),
+        DataType::Numeric => collect_parquet_decimal_series(series, column),
+        DataType::Json => {
+            let values = collect_parquet_string_values(series)?;
+            Ok(Series::new(column.name.as_str().into(), values))
+        }
     }
+}
+
+fn collect_parquet_decimal_series(series: &Series, column: &ColumnSchema) -> Result<Series> {
+    let values = collect_parquet_string_values(series)?;
+    let refs: Vec<Option<&str>> = values.iter().map(|value| value.as_deref()).collect();
+    let string_series = Series::new(column.name.as_str().into(), refs);
+    string_series
+        .str()
+        .context("numeric parquet batch load requires string-backed values")?
+        .to_decimal_infer(string_series.len())
+        .context("converting numeric batch load column to parquet decimal")
 }
 
 fn collect_parquet_string_values(series: &Series) -> Result<Vec<Option<String>>> {
@@ -489,31 +442,6 @@ mod tests {
     }
 
     #[test]
-    fn parquet_batch_load_supported_rejects_json_and_numeric() {
-        let json_schema = TableSchema {
-            name: "public__items".to_string(),
-            columns: vec![ColumnSchema {
-                name: "payload".to_string(),
-                data_type: DataType::Json,
-                nullable: true,
-            }],
-            primary_key: Some("id".to_string()),
-        };
-        assert!(!parquet_batch_load_supported(&json_schema));
-        let numeric_schema = TableSchema {
-            name: "public__prices".to_string(),
-            columns: vec![ColumnSchema {
-                name: "amount".to_string(),
-                data_type: DataType::Numeric,
-                nullable: true,
-            }],
-            primary_key: None,
-        };
-        assert!(!parquet_batch_load_supported(&numeric_schema));
-        assert!(parquet_batch_load_supported(&parquet_schema()));
-    }
-
-    #[test]
     fn dataframe_to_parquet_bytes_round_trips_supported_batch_load_types() {
         let metadata = MetadataColumns::default();
         let schema = parquet_schema();
@@ -583,21 +511,47 @@ mod tests {
     }
 
     #[test]
-    fn dataframe_to_ndjson_bytes_emits_one_json_object_per_line() {
+    fn dataframe_to_parquet_bytes_round_trips_numeric_and_json_types() {
+        let schema = TableSchema {
+            name: "public__documents".to_string(),
+            columns: vec![
+                ColumnSchema {
+                    name: "id".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+                ColumnSchema {
+                    name: "amount".to_string(),
+                    data_type: DataType::Numeric,
+                    nullable: true,
+                },
+                ColumnSchema {
+                    name: "payload".to_string(),
+                    data_type: DataType::Json,
+                    nullable: true,
+                },
+            ],
+            primary_key: Some("id".to_string()),
+        };
         let frame = DataFrame::new(vec![
-            polars::prelude::Series::new("id".into(), &[1_i64, 2_i64]).into(),
-            polars::prelude::Series::new("name".into(), &["alpha", "beta"]).into(),
+            polars::prelude::Series::new("id".into(), &[1_i64]).into(),
+            polars::prelude::Series::new("amount".into(), &["123.45"]).into(),
+            polars::prelude::Series::new("payload".into(), &["{\"status\":\"ok\"}"]).into(),
         ])
         .expect("frame");
 
-        let payload = dataframe_to_ndjson_bytes(&frame).expect("ndjson bytes");
-        let text = String::from_utf8(payload).expect("utf8");
-        let lines: Vec<&str> = text.lines().collect();
+        let payload = dataframe_to_parquet_bytes(&frame, &schema).expect("parquet bytes");
+        let parquet = ParquetReader::new(Cursor::new(payload))
+            .finish()
+            .expect("read parquet");
 
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("\"id\":1"));
-        assert!(lines[0].contains("\"name\":\"alpha\""));
-        assert!(lines[1].contains("\"id\":2"));
-        assert!(lines[1].contains("\"name\":\"beta\""));
+        assert!(matches!(
+            parquet.column("amount").expect("amount").dtype(),
+            polars::prelude::DataType::Decimal(_, Some(2))
+        ));
+        assert_eq!(
+            parquet.column("payload").expect("payload").dtype(),
+            &polars::prelude::DataType::String
+        );
     }
 }

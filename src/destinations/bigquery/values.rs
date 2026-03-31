@@ -24,7 +24,7 @@ pub(super) fn bq_fields_from_schema(columns: &[ColumnSchema]) -> Vec<TableFieldS
                 DataType::Date => TableFieldType::Date,
                 DataType::Bytes => TableFieldType::Bytes,
                 DataType::Numeric => TableFieldType::Numeric,
-                DataType::Json => TableFieldType::Json,
+                DataType::Json => TableFieldType::String,
             };
             TableFieldSchema {
                 name: col.name.clone(),
@@ -287,4 +287,23 @@ pub(super) fn timestamp_string_to_micros(value: &str) -> Result<i64> {
         .with_context(|| format!("parsing timestamp {}", value))?
         .with_timezone(&Utc);
     Ok(timestamp.timestamp_micros())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ColumnSchema, DataType};
+    use gcloud_bigquery::http::table::TableFieldType;
+
+    #[test]
+    fn bq_fields_from_schema_maps_json_to_string() {
+        let fields = bq_fields_from_schema(&[ColumnSchema {
+            name: "payload".to_string(),
+            data_type: DataType::Json,
+            nullable: true,
+        }]);
+
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].data_type, TableFieldType::String);
+    }
 }
