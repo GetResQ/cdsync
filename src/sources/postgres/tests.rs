@@ -691,6 +691,25 @@ fn snapshot_table_write_plan_truncates_new_bootstrap_tables_on_resume() {
 }
 
 #[test]
+fn cdc_slot_name_defaults_to_connection_scoped_name() {
+    let slot_name = super::cdc_sync::cdc_slot_name("app_staging", None).expect("slot name");
+    assert_eq!(slot_name, "cdsync_app_staging_cdc");
+}
+
+#[test]
+fn cdc_slot_name_sanitizes_connection_id() {
+    let slot_name =
+        super::cdc_sync::cdc_slot_name("App/Staging Public", None).expect("slot name");
+    assert_eq!(slot_name, "cdsync_app_staging_public_cdc");
+}
+
+#[test]
+fn cdc_slot_name_honors_explicit_pipeline_id_override() {
+    let slot_name = super::cdc_sync::cdc_slot_name("ignored", Some(1101)).expect("slot name");
+    assert_eq!(slot_name, "supabase_etl_apply_1101");
+}
+
+#[test]
 fn build_select_columns_casts_string_columns_to_text() {
     let schema = TableSchema {
         name: "public.example".to_string(),

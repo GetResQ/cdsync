@@ -503,6 +503,10 @@ impl SyncStateStore {
 }
 
 impl StateHandle {
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
+
     pub async fn save_connection_state(
         &self,
         connection_state: &ConnectionState,

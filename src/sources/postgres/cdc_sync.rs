@@ -150,6 +150,40 @@ fn bootstrap_snapshot_slot_name(slot_name: &str) -> Result<String> {
     Ok(snapshot_slot_name)
 }
 
+pub(super) fn cdc_slot_name(connection_id: &str, pipeline_id: Option<u64>) -> Result<String> {
+    if let Some(pipeline_id) = pipeline_id {
+        return EtlReplicationSlot::for_apply_worker(pipeline_id)
+            .try_into()
+            .context("building CDC replication slot name");
+    }
+
+    let mut normalized = String::with_capacity(connection_id.len());
+    for ch in connection_id.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() || lower == '_' {
+            normalized.push(lower);
+        } else {
+            normalized.push('_');
+        }
+    }
+    while normalized.contains("__") {
+        normalized = normalized.replace("__", "_");
+    }
+    normalized = normalized.trim_matches('_').to_string();
+    if normalized.is_empty() {
+        anyhow::bail!(
+            "connection id {} does not produce a valid CDC slot name",
+            connection_id
+        );
+    }
+
+    let slot_name = format!("cdsync_{}_cdc", normalized);
+    if slot_name.len() > 63 {
+        anyhow::bail!("CDC replication slot name {} exceeds postgres limit", slot_name);
+    }
+    Ok(slot_name)
+}
+
 impl PostgresSource {
     pub async fn sync_cdc(&self, request: CdcSyncRequest<'_>) -> Result<()> {
         let CdcSyncRequest {
@@ -184,7 +218,8 @@ impl PostgresSource {
             .publication
             .as_deref()
             .context("postgres.publication is required when CDC is enabled")?;
-        let pipeline_id = self.config.cdc_pipeline_id.unwrap_or(1);
+        let pipeline_id = self.config.cdc_pipeline_id;
+        let stream_pipeline_id = pipeline_id.unwrap_or(1);
         let batch_size = self
             .config
             .cdc_batch_size
@@ -313,9 +348,13 @@ impl PostgresSource {
             snapshot_concurrency,
         );
 
-        let slot_name: String = EtlReplicationSlot::for_apply_worker(pipeline_id)
-            .try_into()
-            .context("building CDC replication slot name")?;
+        let slot_name = cdc_slot_name(
+            state_handle
+                .as_ref()
+                .map(|handle| handle.connection_id())
+                .unwrap_or("postgres"),
+            pipeline_id,
+        )?;
 
         {
             let cdc_state = state.postgres_cdc.get_or_insert_with(Default::default);
@@ -665,7 +704,7 @@ impl PostgresSource {
                     publication,
                     slot_name: &slot_name,
                     start_lsn,
-                    pipeline_id,
+                    pipeline_id: stream_pipeline_id,
                     idle_timeout,
                     max_pending_events,
                     apply_concurrency: snapshot_concurrency,
