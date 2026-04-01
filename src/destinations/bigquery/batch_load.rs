@@ -139,8 +139,8 @@ impl BigQueryDestination {
                     autodetect: Some(false),
                     ignore_unknown_values: Some(false),
                     decimal_target_types: Some(vec![
-                        DecimalTargetType::Numeric,
                         DecimalTargetType::Bignumeric,
+                        DecimalTargetType::Numeric,
                         DecimalTargetType::String,
                     ]),
                     parquet_options: Some(ParquetOptions::default()),

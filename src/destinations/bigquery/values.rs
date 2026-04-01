@@ -24,7 +24,7 @@ pub(super) fn bq_fields_from_schema(columns: &[ColumnSchema]) -> Vec<TableFieldS
                 DataType::Date => TableFieldType::Date,
                 DataType::Interval => TableFieldType::Float64,
                 DataType::Bytes => TableFieldType::Bytes,
-                DataType::Numeric => TableFieldType::Numeric,
+                DataType::Numeric => TableFieldType::Bignumeric,
                 DataType::Json => TableFieldType::String,
             };
             TableFieldSchema {
@@ -318,5 +318,17 @@ mod tests {
 
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].data_type, TableFieldType::Float64);
+    }
+
+    #[test]
+    fn bq_fields_from_schema_maps_numeric_to_bignumeric() {
+        let fields = bq_fields_from_schema(&[ColumnSchema {
+            name: "amount".to_string(),
+            data_type: DataType::Numeric,
+            nullable: true,
+        }]);
+
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].data_type, TableFieldType::Bignumeric);
     }
 }
