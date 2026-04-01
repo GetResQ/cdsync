@@ -74,6 +74,26 @@ docker run --rm \
   cdsync-runner --config /etc/cdsync/config.yaml --connection app
 ```
 
+## GitHub Releases
+
+`cdsync` publishes release binaries from GitHub Actions. This repo owns the
+binary artifacts only; downstream runtimes are expected to own their own config,
+container image assembly, and ECS rollout.
+
+Release artifacts are packaged as:
+
+- `cdsync-x86_64-unknown-linux-gnu.tar.gz`
+- `cdsync-aarch64-unknown-linux-gnu.tar.gz`
+- matching `.sha256` files
+
+The intended downstream contract is:
+
+1. choose a tagged `cdsync` GitHub release
+2. download the Linux artifact for the target runtime
+3. build a thin runtime image around that binary
+4. inject environment/config from the downstream infra repo
+5. deploy the resulting image to the target scheduler
+
 ## Real BigQuery
 
 For live BigQuery validation, set:
