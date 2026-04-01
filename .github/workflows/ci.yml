@@ -4,38 +4,79 @@ on:
   pull_request:
   push:
     branches:
-      - main
+      - master
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
 
 jobs:
   fmt:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache Rust dependencies
+        uses: useblacksmith/rust-cache@v3
+        with:
+          cache-workspace-crates: true
       - name: Check formatting
         run: cargo fmt --all --check
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
 
   clippy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache Rust dependencies
+        uses: useblacksmith/rust-cache@v3
+        with:
+          cache-workspace-crates: true
       - name: Lint
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache Rust dependencies
+        uses: useblacksmith/rust-cache@v3
+        with:
+          cache-workspace-crates: true
       - name: Unit and non-ignored integration tests
         run: cargo test
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
 
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache Rust dependencies
+        uses: useblacksmith/rust-cache@v3
+        with:
+          cache-workspace-crates: true
       - name: Install postgres client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
       - name: Start emulator services
@@ -60,3 +101,6 @@ jobs:
       - name: Stop emulator services
         if: always()
         run: docker compose -f docker-compose.e2e.yml --profile itest down -v
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
