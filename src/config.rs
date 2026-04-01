@@ -520,11 +520,12 @@ admin_api:
   enabled: false
   bind: "127.0.0.1:8080"
   auth:
-    service_jwt_allowed_issuers: ["caller-service"]
-    service_jwt_allowed_audiences: ["cdsync"]
+    service_jwt_allowed_issuers: []
+    service_jwt_allowed_audiences: []
     required_scopes: ["cdsync:admin"]
     # Public keys should come from the environment, not inline config.
-    # See .env.example for CDSYNC_SERVICE_JWT_* placeholders.
+    # Set CDSYNC_SERVICE_JWT_* in the runtime environment or replace these
+    # fields with your own issuer/audience values.
 
 observability:
   service_name: "cdsync"
