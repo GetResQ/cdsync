@@ -4,9 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use polars::io::parquet::write::{ParquetCompression, ParquetWriter};
-use polars::prelude::{
-    AnyValue, BinaryChunked, DataFrame, IntoSeries, NamedFrom, NewChunkedArray, Series,
-};
+use polars::prelude::{AnyValue, DataFrame, NamedFrom, Series};
 use token_source::TokenSource;
 use tokio::time::sleep;
 use uuid::Uuid;
@@ -22,7 +20,7 @@ use gcloud_bigquery::http::table::{
 
 use super::BigQueryDestination;
 use crate::destinations::bigquery::values::{
-    anyvalue_to_bool, anyvalue_to_bytes, anyvalue_to_date_days, anyvalue_to_f64, anyvalue_to_i64,
+    anyvalue_to_bool, anyvalue_to_date_days, anyvalue_to_f64, anyvalue_to_i64,
     anyvalue_to_owned_string, anyvalue_to_timestamp_micros, bq_fields_from_schema,
 };
 use crate::destinations::with_metadata_schema;
@@ -275,9 +273,8 @@ fn parquet_batch_load_series(series: &Series, column: &ColumnSchema) -> Result<S
             Ok(out)
         }
         DataType::Bytes => {
-            let values = collect_parquet_binary_values(series)?;
-            let refs: Vec<Option<&[u8]>> = values.iter().map(|value| value.as_deref()).collect();
-            Ok(BinaryChunked::from_slice_options(column.name.as_str().into(), &refs).into_series())
+            let values = collect_parquet_string_values(series)?;
+            Ok(Series::new(column.name.as_str().into(), values))
         }
         DataType::Numeric => collect_parquet_decimal_series(series, column),
         DataType::Json => {
@@ -371,19 +368,6 @@ fn collect_parquet_date_values(series: &Series) -> Result<Vec<Option<i32>>> {
                 Ok(None)
             } else {
                 anyvalue_to_date_days(&value).map(Some)
-            }
-        })
-        .collect()
-}
-
-fn collect_parquet_binary_values(series: &Series) -> Result<Vec<Option<Vec<u8>>>> {
-    series
-        .iter()
-        .map(|value| {
-            if matches!(value, AnyValue::Null) {
-                Ok(None)
-            } else {
-                anyvalue_to_bytes(&value).map(Some)
             }
         })
         .collect()
@@ -488,7 +472,7 @@ mod tests {
         );
         assert_eq!(
             parquet.column("raw_bytes").expect("raw_bytes").dtype(),
-            &polars::prelude::DataType::Binary
+            &polars::prelude::DataType::String
         );
         assert_eq!(
             parquet.column("name").expect("name").dtype(),

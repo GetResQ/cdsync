@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
 use futures::StreamExt;
 use gcloud_bigquery::storage_write::AppendRowsRequestBuilder;
 use gcloud_bigquery::storage_write::stream::committed::CommittedStream;
@@ -20,8 +19,8 @@ use tracing::{error, warn};
 
 use super::BigQueryDestination;
 use crate::destinations::bigquery::values::{
-    anyvalue_to_bool, anyvalue_to_bytes, anyvalue_to_f64, anyvalue_to_i64,
-    anyvalue_to_owned_string, anyvalue_to_timestamp_micros,
+    anyvalue_to_bool, anyvalue_to_f64, anyvalue_to_i64, anyvalue_to_owned_string,
+    anyvalue_to_timestamp_micros,
 };
 use crate::destinations::with_metadata_schema;
 use crate::types::{DataType, TableSchema};
@@ -199,12 +198,15 @@ fn build_storage_write_descriptor(schema: &TableSchema) -> DescriptorProto {
 
 fn storage_write_field_type(data_type: DataType) -> Type {
     match data_type {
-        DataType::String | DataType::Date | DataType::Numeric | DataType::Json => Type::String,
+        DataType::String
+        | DataType::Date
+        | DataType::Bytes
+        | DataType::Numeric
+        | DataType::Json => Type::String,
         DataType::Int64 => Type::Int64,
         DataType::Float64 | DataType::Interval => Type::Double,
         DataType::Bool => Type::Bool,
         DataType::Timestamp => Type::Int64,
-        DataType::Bytes => Type::Bytes,
     }
 }
 
@@ -259,14 +261,15 @@ fn anyvalue_to_storage_write_value(
         return Ok(None);
     }
     let reflect_value = match data_type {
-        DataType::String | DataType::Date | DataType::Numeric | DataType::Json => {
-            ReflectValue::String(anyvalue_to_owned_string(value)?)
-        }
+        DataType::String
+        | DataType::Date
+        | DataType::Bytes
+        | DataType::Numeric
+        | DataType::Json => ReflectValue::String(anyvalue_to_owned_string(value)?),
         DataType::Int64 => ReflectValue::I64(anyvalue_to_i64(value)?),
         DataType::Float64 | DataType::Interval => ReflectValue::F64(anyvalue_to_f64(value)?),
         DataType::Bool => ReflectValue::Bool(anyvalue_to_bool(value)?),
         DataType::Timestamp => ReflectValue::I64(anyvalue_to_timestamp_micros(value)?),
-        DataType::Bytes => ReflectValue::Bytes(Bytes::from(anyvalue_to_bytes(value)?)),
     };
     Ok(Some(reflect_value))
 }

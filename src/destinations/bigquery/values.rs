@@ -23,7 +23,7 @@ pub(super) fn bq_fields_from_schema(columns: &[ColumnSchema]) -> Vec<TableFieldS
                 DataType::Timestamp => TableFieldType::Timestamp,
                 DataType::Date => TableFieldType::Date,
                 DataType::Interval => TableFieldType::Float64,
-                DataType::Bytes => TableFieldType::Bytes,
+                DataType::Bytes => TableFieldType::String,
                 DataType::Numeric => TableFieldType::Bignumeric,
                 DataType::Json => TableFieldType::String,
             };
@@ -259,20 +259,6 @@ pub(super) fn anyvalue_to_date_days(value: &AnyValue) -> Result<i32> {
     }
 }
 
-pub(super) fn anyvalue_to_bytes(value: &AnyValue) -> Result<Vec<u8>> {
-    match value {
-        AnyValue::Binary(bytes) => Ok(bytes.to_vec()),
-        AnyValue::BinaryOwned(bytes) => Ok(bytes.clone()),
-        AnyValue::String(value) => STANDARD
-            .decode(value)
-            .with_context(|| format!("decoding base64 bytes {}", value)),
-        AnyValue::StringOwned(value) => STANDARD
-            .decode(value.as_bytes())
-            .with_context(|| format!("decoding base64 bytes {}", value)),
-        other => anyhow::bail!("unsupported bytes value {:?}", other),
-    }
-}
-
 pub(super) fn date_string_to_days(value: &str) -> Result<i32> {
     let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
         .with_context(|| format!("parsing date {}", value))?;
@@ -318,6 +304,18 @@ mod tests {
 
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].data_type, TableFieldType::Float64);
+    }
+
+    #[test]
+    fn bq_fields_from_schema_maps_bytes_to_string() {
+        let fields = bq_fields_from_schema(&[ColumnSchema {
+            name: "payload".to_string(),
+            data_type: DataType::Bytes,
+            nullable: true,
+        }]);
+
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].data_type, TableFieldType::String);
     }
 
     #[test]
