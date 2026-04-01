@@ -7,25 +7,61 @@ use uuid::Uuid;
 #[test]
 fn maps_pg_types_to_internal_types() {
     assert_eq!(
-        pg_type_to_data_type_from_type(&etl::types::Type::INT4),
+        pg_type_to_data_type_from_type(&etl::types::Type::INT4).expect("int4"),
         DataType::Int64
     );
     assert_eq!(
-        pg_type_to_data_type_from_type(&etl::types::Type::FLOAT8),
+        pg_type_to_data_type_from_type(&etl::types::Type::FLOAT8).expect("float8"),
         DataType::Float64
     );
     assert_eq!(
-        pg_type_to_data_type_from_type(&etl::types::Type::BOOL),
+        pg_type_to_data_type_from_type(&etl::types::Type::BOOL).expect("bool"),
         DataType::Bool
     );
     assert_eq!(
-        pg_type_to_data_type_from_type(&etl::types::Type::TIMESTAMPTZ),
+        pg_type_to_data_type_from_type(&etl::types::Type::TIMESTAMPTZ).expect("timestamptz"),
         DataType::Timestamp
     );
     assert_eq!(
-        pg_type_to_data_type_from_type(&etl::types::Type::INTERVAL),
+        pg_type_to_data_type_from_type(&etl::types::Type::INTERVAL).expect("interval"),
         DataType::Interval
     );
+}
+
+#[test]
+fn maps_array_and_range_types_to_json() {
+    assert_eq!(
+        pg_type_to_data_type_from_type(&etl::types::Type::INT4_ARRAY).expect("int4 array"),
+        DataType::Json
+    );
+    assert_eq!(
+        pg_type_to_data_type_from_type(&etl::types::Type::INT4_RANGE).expect("int4 range"),
+        DataType::Json
+    );
+}
+
+#[test]
+fn rejects_multirange_and_builtin_unsupported_types() {
+    assert!(pg_type_to_data_type_from_type(&etl::types::Type::INT4MULTI_RANGE).is_err());
+    assert!(pg_type_to_data_type_from_type(&etl::types::Type::XID8).is_err());
+}
+
+#[test]
+fn pg_catalog_data_type_handles_arrays_json_and_unsupported_types() {
+    assert_eq!(
+        pg_type_to_data_type("ARRAY", "_int4", "b").expect("array"),
+        DataType::Json
+    );
+    assert_eq!(
+        pg_type_to_data_type("USER-DEFINED", "hstore", "b").expect("hstore"),
+        DataType::Json
+    );
+    assert_eq!(
+        pg_type_to_data_type("USER-DEFINED", "status_enum", "e").expect("enum"),
+        DataType::String
+    );
+    assert!(pg_type_to_data_type("USER-DEFINED", "custom_composite", "c").is_err());
+    assert!(pg_type_to_data_type("USER-DEFINED", "int4multirange", "m").is_err());
 }
 
 #[test]
@@ -494,6 +530,24 @@ fn build_select_columns_projects_interval_as_epoch_seconds() {
 }
 
 #[test]
+fn build_select_columns_projects_json_columns_via_to_json() {
+    let schema = TableSchema {
+        name: "public.example".to_string(),
+        columns: vec![ColumnSchema {
+            name: "tags".to_string(),
+            data_type: DataType::Json,
+            nullable: true,
+        }],
+        primary_key: Some("id".to_string()),
+    };
+
+    assert_eq!(
+        build_select_columns(&schema),
+        "to_json(\"tags\")::text as \"tags\""
+    );
+}
+
+#[test]
 fn parse_postgres_interval_to_seconds_handles_postgres_style_values() {
     assert_eq!(
         parse_postgres_interval_to_seconds("3 days 04:05:06.5").expect("interval"),
@@ -507,6 +561,21 @@ fn parse_postgres_interval_to_seconds_handles_postgres_style_values() {
         parse_postgres_interval_to_seconds("-01:30:00").expect("interval"),
         -5_400.0
     );
+}
+
+#[test]
+fn parse_text_cell_parses_supported_arrays_and_jsonish_ranges() {
+    match parse_text_cell(&etl::types::Type::INT4_ARRAY, "{1,NULL,3}") {
+        Cell::Array(etl::types::ArrayCell::I32(values)) => {
+            assert_eq!(values, vec![Some(1), None, Some(3)]);
+        }
+        other => panic!("unexpected array cell: {:?}", other),
+    }
+
+    match parse_text_cell(&etl::types::Type::INT4_RANGE, "[1,4)") {
+        Cell::Json(Value::String(value)) => assert_eq!(value, "[1,4)"),
+        other => panic!("unexpected range cell: {:?}", other),
+    }
 }
 
 fn test_state_config() -> Option<crate::config::StateConfig> {

@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bigdecimal::BigDecimal;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use etl::config::{PgConnectionConfig, TlsConfig};
 use etl::destination::Destination as EtlDestinationTrait;
 use etl::replication::client::PgReplicationClient;
@@ -426,10 +426,30 @@ impl PostgresSource {
     pub async fn discover_schema(&self, table: &ResolvedPostgresTable) -> Result<TableSchema> {
         let (schema_name, table_name) = split_table_name(&table.name);
         let rows = sqlx::query(
-            r#"SELECT column_name, data_type, is_nullable
-               FROM information_schema.columns
-               WHERE table_schema = $1 AND table_name = $2
-               ORDER BY ordinal_position"#,
+            r#"
+            SELECT
+                c.column_name,
+                c.data_type,
+                c.udt_name,
+                c.is_nullable,
+                t.typtype::text as typtype
+            FROM information_schema.columns c
+            JOIN pg_namespace n
+              ON n.nspname = c.table_schema
+            JOIN pg_class cl
+              ON cl.relname = c.table_name
+             AND cl.relnamespace = n.oid
+            JOIN pg_attribute a
+              ON a.attrelid = cl.oid
+             AND a.attname = c.column_name
+             AND a.attnum > 0
+             AND NOT a.attisdropped
+            JOIN pg_type t
+              ON t.oid = a.atttypid
+            WHERE c.table_schema = $1
+              AND c.table_name = $2
+            ORDER BY c.ordinal_position
+            "#,
         )
         .bind(schema_name)
         .bind(table_name)
@@ -440,10 +460,12 @@ impl PostgresSource {
         for row in rows {
             let name: String = row.try_get("column_name")?;
             let data_type: String = row.try_get("data_type")?;
+            let udt_name: String = row.try_get("udt_name")?;
             let nullable: String = row.try_get("is_nullable")?;
+            let typtype: String = row.try_get("typtype")?;
             all_columns.push(ColumnSchema {
                 name,
-                data_type: pg_type_to_data_type(&data_type),
+                data_type: pg_type_to_data_type(&data_type, &udt_name, &typtype)?,
                 nullable: nullable == "YES",
             });
         }
@@ -650,9 +672,10 @@ fn build_select_columns(schema: &TableSchema) -> String {
         .map(|column| {
             let ident = quote_pg_identifier(&column.name);
             match column.data_type {
-                DataType::String | DataType::Numeric | DataType::Json => {
+                DataType::String | DataType::Numeric => {
                     format!("{ident}::text as {ident}")
                 }
+                DataType::Json => format!("to_json({ident})::text as {ident}"),
                 DataType::Interval => format!("extract(epoch from {ident}) as {ident}"),
                 _ => ident,
             }

@@ -1,7 +1,30 @@
 use super::*;
 
-pub(super) fn pg_type_to_data_type(data_type: &str) -> DataType {
-    match data_type {
+pub(super) fn pg_type_to_data_type(
+    data_type: &str,
+    udt_name: &str,
+    typtype: &str,
+) -> Result<DataType> {
+    if matches!(typtype, "c") {
+        anyhow::bail!("unsupported PostgreSQL composite type `{}`", udt_name);
+    }
+    if matches!(typtype, "m") || is_multirange_type_name(udt_name) {
+        anyhow::bail!("unsupported PostgreSQL multirange type `{}`", udt_name);
+    }
+    if matches!(udt_name, "oid8" | "xid8") {
+        anyhow::bail!("unsupported PostgreSQL type `{}`", udt_name);
+    }
+    if data_type == "ARRAY" {
+        return Ok(DataType::Json);
+    }
+    if matches!(typtype, "r") || is_json_like_type_name(udt_name) {
+        return Ok(DataType::Json);
+    }
+    if matches!(typtype, "e") {
+        return Ok(DataType::String);
+    }
+
+    Ok(match data_type {
         "smallint" | "integer" | "bigint" => DataType::Int64,
         "real" | "double precision" => DataType::Float64,
         "numeric" | "decimal" => DataType::Numeric,
@@ -12,7 +35,7 @@ pub(super) fn pg_type_to_data_type(data_type: &str) -> DataType {
         "json" | "jsonb" => DataType::Json,
         "bytea" => DataType::Bytes,
         _ => DataType::String,
-    }
+    })
 }
 
 pub(super) fn rows_to_batch(
@@ -401,9 +424,32 @@ pub(super) fn polars_schema_with_metadata(
     Ok(Schema::from_iter(fields))
 }
 
-pub(super) fn pg_type_to_data_type_from_type(typ: &etl::types::Type) -> DataType {
-    use etl::types::Type;
-    match *typ {
+pub(super) fn pg_type_to_data_type_from_type(typ: &etl::types::Type) -> Result<DataType> {
+    use etl::types::{Kind, Type};
+
+    if matches!(typ.name(), "oid8" | "xid8") {
+        anyhow::bail!("unsupported PostgreSQL type `{}`", typ.name());
+    }
+    if is_json_like_type_name(typ.name()) {
+        return Ok(DataType::Json);
+    }
+
+    match typ.kind() {
+        Kind::Array(_) => return Ok(DataType::Json),
+        Kind::Range(_) => return Ok(DataType::Json),
+        Kind::Multirange(_) => {
+            anyhow::bail!("unsupported PostgreSQL multirange type `{}`", typ.name())
+        }
+        Kind::Composite(_) => {
+            anyhow::bail!("unsupported PostgreSQL composite type `{}`", typ.name())
+        }
+        Kind::Domain(inner) => return pg_type_to_data_type_from_type(inner),
+        Kind::Enum(_) => return Ok(DataType::String),
+        Kind::Simple | Kind::Pseudo => {}
+        _ => {}
+    }
+
+    Ok(match *typ {
         Type::INT2 | Type::INT4 | Type::INT8 => DataType::Int64,
         Type::FLOAT4 | Type::FLOAT8 => DataType::Float64,
         Type::BOOL => DataType::Bool,
@@ -414,7 +460,7 @@ pub(super) fn pg_type_to_data_type_from_type(typ: &etl::types::Type) -> DataType
         Type::BYTEA => DataType::Bytes,
         Type::NUMERIC => DataType::Numeric,
         _ => DataType::String,
-    }
+    })
 }
 
 pub(super) fn cdc_table_info_from_schema(
@@ -425,12 +471,14 @@ pub(super) fn cdc_table_info_from_schema(
     let source_columns: Vec<ColumnSchema> = etl_schema
         .column_schemas
         .iter()
-        .map(|col| ColumnSchema {
-            name: col.name.clone(),
-            data_type: pg_type_to_data_type_from_type(&col.typ),
-            nullable: col.nullable,
+        .map(|col| {
+            Ok(ColumnSchema {
+                name: col.name.clone(),
+                data_type: pg_type_to_data_type_from_type(&col.typ)?,
+                nullable: col.nullable,
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     let required = required_columns(table_cfg);
     ensure_required_columns(&source_columns, &required)?;
@@ -496,7 +544,27 @@ pub(super) fn tuple_to_row(
 }
 
 pub(super) fn parse_text_cell(typ: &etl::types::Type, text: &str) -> Cell {
-    use etl::types::Type;
+    use etl::types::{Kind, Type};
+
+    if is_json_like_type_name(typ.name()) {
+        return Cell::Json(Value::String(text.to_string()));
+    }
+
+    match typ.kind() {
+        Kind::Array(inner) => {
+            return parse_text_array_cell(inner, text)
+                .unwrap_or_else(|_| Cell::String(text.to_string()));
+        }
+        Kind::Range(_) => {
+            return Cell::Json(Value::String(text.to_string()));
+        }
+        Kind::Domain(inner) => return parse_text_cell(inner, text),
+        Kind::Enum(_) => return Cell::String(text.to_string()),
+        Kind::Multirange(_) | Kind::Composite(_) => return Cell::String(text.to_string()),
+        Kind::Simple | Kind::Pseudo => {}
+        _ => {}
+    }
+
     match *typ {
         Type::BOOL => match text {
             "t" | "true" | "TRUE" => Cell::Bool(true),
@@ -519,6 +587,241 @@ pub(super) fn parse_text_cell(typ: &etl::types::Type, text: &str) -> Cell {
             .unwrap_or_else(|_| Cell::String(text.to_string())),
         _ => Cell::String(text.to_string()),
     }
+}
+
+fn parse_text_array_cell(inner: &etl::types::Type, text: &str) -> Result<Cell> {
+    use etl::types::{ArrayCell, Kind, Type};
+
+    match inner.kind() {
+        Kind::Domain(base) => return parse_text_array_cell(base, text),
+        Kind::Enum(_) => {
+            return parse_postgres_text_array(
+                text,
+                |value| Ok(Some(value.to_string())),
+                ArrayCell::String,
+            );
+        }
+        Kind::Array(_) => {
+            return parse_postgres_text_array(
+                text,
+                |value| Ok(Some(value.to_string())),
+                ArrayCell::String,
+            );
+        }
+        Kind::Range(_) => {
+            return parse_postgres_text_array(
+                text,
+                |value| Ok(Some(Value::String(value.to_string()))),
+                ArrayCell::Json,
+            );
+        }
+        Kind::Multirange(_) | Kind::Composite(_) => {
+            anyhow::bail!(
+                "unsupported PostgreSQL array element type `{}`",
+                inner.name()
+            )
+        }
+        Kind::Simple | Kind::Pseudo => {}
+        _ => {}
+    }
+
+    match *inner {
+        Type::BOOL => parse_postgres_text_array(
+            text,
+            |value| match value {
+                "t" | "true" | "TRUE" => Ok(Some(true)),
+                "f" | "false" | "FALSE" => Ok(Some(false)),
+                _ => anyhow::bail!("invalid boolean array value `{}`", value),
+            },
+            ArrayCell::Bool,
+        ),
+        Type::CHAR | Type::BPCHAR | Type::VARCHAR | Type::NAME | Type::TEXT => {
+            parse_postgres_text_array(text, |value| Ok(Some(value.to_string())), ArrayCell::String)
+        }
+        Type::INT2 => parse_postgres_text_array(
+            text,
+            |value| Ok(Some(value.parse::<i16>()?)),
+            ArrayCell::I16,
+        ),
+        Type::INT4 => parse_postgres_text_array(
+            text,
+            |value| Ok(Some(value.parse::<i32>()?)),
+            ArrayCell::I32,
+        ),
+        Type::INT8 => parse_postgres_text_array(
+            text,
+            |value| Ok(Some(value.parse::<i64>()?)),
+            ArrayCell::I64,
+        ),
+        Type::FLOAT4 => parse_postgres_text_array(
+            text,
+            |value| Ok(Some(value.parse::<f32>()?)),
+            ArrayCell::F32,
+        ),
+        Type::FLOAT8 | Type::INTERVAL => parse_postgres_text_array(
+            text,
+            |value| {
+                if matches!(*inner, Type::INTERVAL) {
+                    Ok(Some(parse_postgres_interval_to_seconds(value)?))
+                } else {
+                    Ok(Some(value.parse::<f64>()?))
+                }
+            },
+            ArrayCell::F64,
+        ),
+        Type::NUMERIC => {
+            parse_postgres_text_array(text, |value| Ok(Some(value.parse()?)), ArrayCell::Numeric)
+        }
+        Type::DATE => parse_postgres_text_array(
+            text,
+            |value| Ok(Some(NaiveDate::parse_from_str(value, "%Y-%m-%d")?)),
+            ArrayCell::Date,
+        ),
+        Type::TIME => parse_postgres_text_array(
+            text,
+            |value| Ok(Some(NaiveTime::parse_from_str(value, "%H:%M:%S%.f")?)),
+            ArrayCell::Time,
+        ),
+        Type::TIMESTAMP => parse_postgres_text_array(
+            text,
+            |value| {
+                Ok(Some(NaiveDateTime::parse_from_str(
+                    value,
+                    "%Y-%m-%d %H:%M:%S%.f",
+                )?))
+            },
+            ArrayCell::Timestamp,
+        ),
+        Type::TIMESTAMPTZ => parse_postgres_text_array(
+            text,
+            |value| Ok(Some(parse_timestamptz_text(value)?)),
+            ArrayCell::TimestampTz,
+        ),
+        Type::UUID => parse_postgres_text_array(
+            text,
+            |value| Ok(Some(Uuid::parse_str(value)?)),
+            ArrayCell::Uuid,
+        ),
+        Type::JSON | Type::JSONB => parse_postgres_text_array(
+            text,
+            |value| Ok(Some(serde_json::from_str(value)?)),
+            ArrayCell::Json,
+        ),
+        Type::OID => parse_postgres_text_array(
+            text,
+            |value| Ok(Some(value.parse::<u32>()?)),
+            ArrayCell::U32,
+        ),
+        Type::BYTEA => parse_postgres_text_array(
+            text,
+            |value| Ok(Some(parse_bytea(value)?)),
+            ArrayCell::Bytes,
+        ),
+        _ => {
+            parse_postgres_text_array(text, |value| Ok(Some(value.to_string())), ArrayCell::String)
+        }
+    }
+}
+
+fn parse_postgres_text_array<P, M, T>(text: &str, mut parse: P, map: M) -> Result<Cell>
+where
+    P: FnMut(&str) -> Result<Option<T>>,
+    M: FnOnce(Vec<Option<T>>) -> etl::types::ArrayCell,
+{
+    if text.len() < 2 {
+        anyhow::bail!("array input too short");
+    }
+    if !text.starts_with('{') || !text.ends_with('}') {
+        anyhow::bail!("array input missing braces");
+    }
+
+    let mut values = Vec::new();
+    let text = &text[1..(text.len() - 1)];
+    let mut value_text = String::with_capacity(10);
+    let mut in_quotes = false;
+    let mut in_escape = false;
+    let mut value_quoted = false;
+    let mut chars = text.chars();
+    let mut done = text.is_empty();
+
+    while !done {
+        loop {
+            match chars.next() {
+                Some(ch) => match ch {
+                    ch if in_escape => {
+                        value_text.push(ch);
+                        in_escape = false;
+                    }
+                    '"' => {
+                        if !in_quotes {
+                            value_quoted = true;
+                        }
+                        in_quotes = !in_quotes;
+                    }
+                    '\\' => in_escape = true,
+                    ',' if !in_quotes => break,
+                    ch => value_text.push(ch),
+                },
+                None => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+
+        let value = if !value_quoted && value_text.eq_ignore_ascii_case("null") {
+            None
+        } else {
+            parse(&value_text)?
+        };
+        values.push(value);
+        value_text.clear();
+        value_quoted = false;
+    }
+
+    Ok(Cell::Array(map(values)))
+}
+
+fn parse_timestamptz_text(value: &str) -> Result<DateTime<Utc>> {
+    let parsed = match DateTime::<FixedOffset>::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f%#z") {
+        Ok(value) => value,
+        Err(_) => DateTime::<FixedOffset>::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f%:z")?,
+    };
+    Ok(parsed.into())
+}
+
+fn is_json_like_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "hstore"
+            | "geometry"
+            | "geography"
+            | "box"
+            | "circle"
+            | "line"
+            | "lseg"
+            | "path"
+            | "point"
+            | "polygon"
+            | "daterange"
+            | "int4range"
+            | "int8range"
+            | "numrange"
+            | "tsrange"
+            | "tstzrange"
+    )
+}
+
+fn is_multirange_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "datemultirange"
+            | "int4multirange"
+            | "int8multirange"
+            | "nummultirange"
+            | "tsmultirange"
+            | "tstzmultirange"
+    )
 }
 
 pub(super) fn parse_postgres_interval_to_seconds(text: &str) -> Result<f64> {
