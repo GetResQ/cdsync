@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use polars::io::parquet::write::{ParquetCompression, ParquetWriter};
 use polars::prelude::{AnyValue, DataFrame, NamedFrom, Series};
 use token_source::TokenSource;
+use tokio::task;
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -57,7 +58,7 @@ impl BigQueryDestination {
             PARQUET_FILE_EXTENSION,
         );
         let object_uri = format!("gs://{}/{}", bucket, object_name);
-        let body = dataframe_to_parquet_bytes(frame, &schema)?;
+        let body = parquet_payload(frame, &schema).await?;
         self.upload_batch_load_object(
             token_source,
             bucket,
@@ -168,6 +169,19 @@ impl BigQueryDestination {
 
 const PARQUET_FILE_EXTENSION: &str = "parquet";
 const PARQUET_CONTENT_TYPE: &str = "application/vnd.apache.parquet";
+const BATCH_LOAD_PARQUET_BLOCKING_ROWS: usize = 1024;
+
+async fn parquet_payload(frame: &DataFrame, schema: &TableSchema) -> Result<Vec<u8>> {
+    if frame.height() < BATCH_LOAD_PARQUET_BLOCKING_ROWS {
+        return dataframe_to_parquet_bytes(frame, schema);
+    }
+
+    let frame = frame.clone();
+    let schema = schema.clone();
+    task::spawn_blocking(move || dataframe_to_parquet_bytes(&frame, &schema))
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to join batch-load parquet task: {}", err))?
+}
 
 fn build_load_job(
     project_id: &str,

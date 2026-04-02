@@ -93,6 +93,7 @@ async fn e2e_postgres_bigquery_real_cdc_heavy_sync() -> Result<()> {
         schema_changes: Some(SchemaChangePolicy::Auto),
         cdc_pipeline_id: Some(pipeline_id),
         cdc_batch_size: Some(200),
+        cdc_apply_concurrency: Some(8),
         cdc_max_fill_ms: Some(2000),
         cdc_max_pending_events: Some(20_000),
         cdc_idle_timeout_seconds: Some(1),

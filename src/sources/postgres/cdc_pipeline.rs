@@ -180,7 +180,7 @@ pub(super) fn dispatch_cdc_batches(
             inflight_apply.push(Box::pin(async move {
                 let _guard = table_lock.lock().await;
                 apply_dest
-                    .write_events(table_batch.events)
+                    .write_table_events(table_id, table_batch.events)
                     .await
                     .map_err(|err| {
                         anyhow::anyhow!(

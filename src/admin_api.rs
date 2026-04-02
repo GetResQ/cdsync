@@ -24,8 +24,8 @@ use jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER as JWT_CRYPTO_PROVIDER;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
+use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -462,6 +462,7 @@ struct ScrubbedPostgresConfig {
     schema_changes: Option<crate::config::SchemaChangePolicy>,
     cdc_pipeline_id: Option<u64>,
     cdc_batch_size: Option<usize>,
+    cdc_apply_concurrency: Option<usize>,
     cdc_max_fill_ms: Option<u64>,
     cdc_max_pending_events: Option<usize>,
     cdc_idle_timeout_seconds: Option<u64>,
@@ -739,7 +740,8 @@ async fn connection_runtime(
         .find(|connection| connection.id == connection_id)
         .context("connection not found")?;
     let cdc_runtime_state =
-        load_postgres_cdc_runtime_state(connection, sync_state.connections.get(&connection_id)).await;
+        load_postgres_cdc_runtime_state(connection, sync_state.connections.get(&connection_id))
+            .await;
     let runtime = derive_connection_runtime(
         connection,
         sync_state.connections.get(&connection_id),
@@ -779,7 +781,8 @@ async fn progress(
         (None, Vec::new())
     };
     let now = Utc::now();
-    let cdc_runtime_state = load_postgres_cdc_runtime_state(config, connection_state.as_ref()).await;
+    let cdc_runtime_state =
+        load_postgres_cdc_runtime_state(config, connection_state.as_ref()).await;
     let runtime = derive_connection_runtime(
         config,
         connection_state.as_ref(),
@@ -832,7 +835,8 @@ async fn connection_tables(
     } else {
         Vec::new()
     };
-    let cdc_runtime_state = load_postgres_cdc_runtime_state(config, connection_state.as_ref()).await;
+    let cdc_runtime_state =
+        load_postgres_cdc_runtime_state(config, connection_state.as_ref()).await;
     let runtime = derive_connection_runtime(
         config,
         connection_state.as_ref(),
@@ -1012,7 +1016,10 @@ async fn load_postgres_cdc_runtime_state(
 fn checkpoint_has_incomplete_snapshot(checkpoint: Option<&TableCheckpoint>) -> bool {
     checkpoint.is_some_and(|checkpoint| {
         !checkpoint.snapshot_chunks.is_empty()
-            && checkpoint.snapshot_chunks.iter().any(|chunk| !chunk.complete)
+            && checkpoint
+                .snapshot_chunks
+                .iter()
+                .any(|chunk| !chunk.complete)
     })
 }
 
@@ -1025,11 +1032,15 @@ fn derive_connection_runtime(
     metadata: RuntimeMetadata<'_>,
 ) -> ConnectionRuntime {
     let (phase, reason_code) = match state.and_then(|state| state.last_sync_status.as_deref()) {
-        Some("running") if state.is_some_and(|state| {
-            active_checkpoint_map(state, &connection.source)
-                .values()
-                .any(|checkpoint| checkpoint_has_incomplete_snapshot(Some(checkpoint)))
-        }) => ("snapshotting", "snapshot_in_progress"),
+        Some("running")
+            if state.is_some_and(|state| {
+                active_checkpoint_map(state, &connection.source)
+                    .values()
+                    .any(|checkpoint| checkpoint_has_incomplete_snapshot(Some(checkpoint)))
+            }) =>
+        {
+            ("snapshotting", "snapshot_in_progress")
+        }
         Some("running") => match cdc_runtime_state {
             Some(PostgresCdcRuntimeState::Following) => ("running", "cdc_following"),
             Some(PostgresCdcRuntimeState::ContinuityLost) => ("blocked", "cdc_continuity_lost"),
@@ -1074,7 +1085,11 @@ fn build_table_progress(
 ) -> Vec<TableProgress> {
     let mut table_names = configured_entity_names(connection);
     if let Some(state) = state {
-        table_names.extend(active_checkpoint_map(state, &connection.source).keys().cloned());
+        table_names.extend(
+            active_checkpoint_map(state, &connection.source)
+                .keys()
+                .cloned(),
+        );
     }
     table_names.extend(run_tables.iter().map(|table| table.table_name.clone()));
 
@@ -1108,9 +1123,15 @@ fn build_table_progress(
                         .count()
                 })
                 .unwrap_or(0);
-            let (phase, reason_code) = match state.and_then(|state| state.last_sync_status.as_deref())
+            let (phase, reason_code) = match state
+                .and_then(|state| state.last_sync_status.as_deref())
             {
-                Some("failed") if matches!(connection_reason_code, "schema_blocked" | "publication_blocked") => {
+                Some("failed")
+                    if matches!(
+                        connection_reason_code,
+                        "schema_blocked" | "publication_blocked"
+                    ) =>
+                {
                     ("blocked", connection_reason_code)
                 }
                 Some("failed") => ("error", connection_reason_code),
@@ -1123,9 +1144,7 @@ fn build_table_progress(
                         ("blocked", "cdc_continuity_lost")
                     }
                     Some(PostgresCdcRuntimeState::Unknown) => ("pending", "cdc_state_unknown"),
-                    Some(PostgresCdcRuntimeState::Initializing) => {
-                        ("pending", "cdc_initializing")
-                    }
+                    Some(PostgresCdcRuntimeState::Initializing) => ("pending", "cdc_initializing"),
                     None => ("syncing", "sync_in_progress"),
                 },
                 Some("success") if checkpoint.is_some() => ("healthy", "healthy"),
@@ -1227,6 +1246,7 @@ fn scrub_postgres_config(pg: &PostgresConfig) -> ScrubbedPostgresConfig {
         schema_changes: pg.schema_changes.clone(),
         cdc_pipeline_id: pg.cdc_pipeline_id,
         cdc_batch_size: pg.cdc_batch_size,
+        cdc_apply_concurrency: pg.cdc_apply_concurrency,
         cdc_max_fill_ms: pg.cdc_max_fill_ms,
         cdc_max_pending_events: pg.cdc_max_pending_events,
         cdc_idle_timeout_seconds: pg.cdc_idle_timeout_seconds,
@@ -1344,6 +1364,7 @@ mod tests {
                     schema_changes: Some(crate::config::SchemaChangePolicy::Auto),
                     cdc_pipeline_id: Some(1),
                     cdc_batch_size: Some(1000),
+                    cdc_apply_concurrency: Some(8),
                     cdc_max_fill_ms: Some(2000),
                     cdc_max_pending_events: Some(100_000),
                     cdc_idle_timeout_seconds: Some(10),
@@ -1524,6 +1545,7 @@ mod tests {
                 schema_changes: Some(crate::config::SchemaChangePolicy::Auto),
                 cdc_pipeline_id: None,
                 cdc_batch_size: None,
+                cdc_apply_concurrency: None,
                 cdc_max_fill_ms: None,
                 cdc_max_pending_events: None,
                 cdc_idle_timeout_seconds: None,
@@ -1592,6 +1614,7 @@ mod tests {
                 schema_changes: Some(crate::config::SchemaChangePolicy::Auto),
                 cdc_pipeline_id: Some(1101),
                 cdc_batch_size: Some(1000),
+                cdc_apply_concurrency: Some(8),
                 cdc_max_fill_ms: Some(2000),
                 cdc_max_pending_events: Some(100_000),
                 cdc_idle_timeout_seconds: Some(10),
@@ -1659,8 +1682,10 @@ mod tests {
         );
 
         assert!(!tables.is_empty());
-        assert!(tables
-            .iter()
-            .all(|table| table.reason_code == "cdc_initializing"));
+        assert!(
+            tables
+                .iter()
+                .all(|table| table.reason_code == "cdc_initializing")
+        );
     }
 }

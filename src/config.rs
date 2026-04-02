@@ -297,6 +297,7 @@ pub struct PostgresConfig {
     pub schema_changes: Option<SchemaChangePolicy>,
     pub cdc_pipeline_id: Option<u64>,
     pub cdc_batch_size: Option<usize>,
+    pub cdc_apply_concurrency: Option<usize>,
     pub cdc_max_fill_ms: Option<u64>,
     pub cdc_max_pending_events: Option<usize>,
     pub cdc_idle_timeout_seconds: Option<u64>,
@@ -316,6 +317,10 @@ impl PostgresConfig {
         self.schema_changes
             .clone()
             .unwrap_or(SchemaChangePolicy::Auto)
+    }
+
+    pub fn cdc_apply_concurrency(&self, fallback: usize) -> usize {
+        self.cdc_apply_concurrency.unwrap_or(fallback).max(1)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -574,6 +579,7 @@ connections:
       schema_changes: auto
       cdc_pipeline_id: 1
       cdc_batch_size: 10000
+      cdc_apply_concurrency: 8
       cdc_max_fill_ms: 2000
       cdc_max_pending_events: 100000
       cdc_idle_timeout_seconds: 10
@@ -719,6 +725,56 @@ connections:
         let metadata = cfg.metadata_columns();
         assert_eq!(metadata.synced_at, "_synced_custom");
         assert_eq!(metadata.deleted_at, "_deleted_custom");
+    }
+
+    #[test]
+    fn cdc_apply_concurrency_defaults_to_fallback() {
+        let config = PostgresConfig {
+            url: "postgres://user:pass@host:5432/db".to_string(),
+            tables: None,
+            table_selection: None,
+            batch_size: None,
+            cdc: Some(true),
+            publication: Some("cdsync_pub".to_string()),
+            publication_mode: None,
+            schema_changes: None,
+            cdc_pipeline_id: None,
+            cdc_batch_size: None,
+            cdc_apply_concurrency: None,
+            cdc_max_fill_ms: None,
+            cdc_max_pending_events: None,
+            cdc_idle_timeout_seconds: None,
+            cdc_tls: None,
+            cdc_tls_ca_path: None,
+            cdc_tls_ca: None,
+        };
+
+        assert_eq!(config.cdc_apply_concurrency(6), 6);
+    }
+
+    #[test]
+    fn cdc_apply_concurrency_honors_explicit_override() {
+        let config = PostgresConfig {
+            url: "postgres://user:pass@host:5432/db".to_string(),
+            tables: None,
+            table_selection: None,
+            batch_size: None,
+            cdc: Some(true),
+            publication: Some("cdsync_pub".to_string()),
+            publication_mode: None,
+            schema_changes: None,
+            cdc_pipeline_id: None,
+            cdc_batch_size: None,
+            cdc_apply_concurrency: Some(9),
+            cdc_max_fill_ms: None,
+            cdc_max_pending_events: None,
+            cdc_idle_timeout_seconds: None,
+            cdc_tls: None,
+            cdc_tls_ca_path: None,
+            cdc_tls_ca: None,
+        };
+
+        assert_eq!(config.cdc_apply_concurrency(4), 9);
     }
 
     #[test]

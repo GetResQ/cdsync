@@ -96,6 +96,7 @@ mod sync_selection_tests {
                 schema_changes: Some(crate::config::SchemaChangePolicy::Auto),
                 cdc_pipeline_id: None,
                 cdc_batch_size: None,
+                cdc_apply_concurrency: None,
                 cdc_max_fill_ms: None,
                 cdc_max_pending_events: None,
                 cdc_idle_timeout_seconds: None,
@@ -232,7 +233,10 @@ mod sync_selection_tests {
             },
         );
 
-        assert_eq!(max_checkpoint_age_seconds(&state, &connection, now), Some(60));
+        assert_eq!(
+            max_checkpoint_age_seconds(&state, &connection, now),
+            Some(60)
+        );
     }
 
     #[tokio::test]
@@ -382,8 +386,8 @@ mod sync_selection_tests {
     }
 
     #[tokio::test]
-    async fn cmd_run_multi_connection_fails_fast_on_invalid_polling_connection() -> anyhow::Result<()>
-    {
+    async fn cmd_run_multi_connection_fails_fast_on_invalid_polling_connection()
+    -> anyhow::Result<()> {
         let config_path = temp_config_path("run-multi-invalid");
         let raw = r#"
 state:
@@ -426,9 +430,10 @@ connections:
 
         let _ = fs::remove_file(&config_path).await;
         let err = result.expect_err("invalid polling config should fail");
-        assert!(err
-            .to_string()
-            .contains("run mode requires connection.schedule.every"));
+        assert!(
+            err.to_string()
+                .contains("run mode requires connection.schedule.every")
+        );
         Ok(())
     }
 }

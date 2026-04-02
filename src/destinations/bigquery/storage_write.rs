@@ -14,6 +14,7 @@ use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor, Value as 
 use prost_types::field_descriptor_proto::{Label, Type};
 use prost_types::{DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet};
 use tokio::sync::Mutex;
+use tokio::task;
 use tonic::Code;
 use tracing::{error, warn};
 
@@ -32,6 +33,8 @@ pub(super) struct StorageWriteTableWriter {
     pub(super) descriptor_proto: DescriptorProto,
     pub(super) message_descriptor: MessageDescriptor,
 }
+
+const STORAGE_WRITE_ENCODING_BLOCKING_ROWS: usize = 512;
 
 impl BigQueryDestination {
     fn storage_write_enabled(&self) -> bool {
@@ -60,7 +63,8 @@ impl BigQueryDestination {
         let writer = self
             .get_or_create_storage_writer(table_id, &full_schema)
             .await?;
-        let rows = encode_storage_write_rows(frame, &full_schema, &writer.message_descriptor)?;
+        let rows = encode_storage_write_rows_async(frame, &full_schema, &writer.message_descriptor)
+            .await?;
         if rows.is_empty() {
             return Ok(true);
         }
@@ -150,6 +154,23 @@ impl BigQueryDestination {
         let mut guard = self.storage_writers.lock().await;
         guard.remove(table_id);
     }
+}
+
+async fn encode_storage_write_rows_async(
+    frame: &DataFrame,
+    schema: &TableSchema,
+    message_descriptor: &MessageDescriptor,
+) -> Result<Vec<Vec<u8>>> {
+    if frame.height() < STORAGE_WRITE_ENCODING_BLOCKING_ROWS {
+        return encode_storage_write_rows(frame, schema, message_descriptor);
+    }
+
+    let frame = frame.clone();
+    let schema = schema.clone();
+    let message_descriptor = message_descriptor.clone();
+    task::spawn_blocking(move || encode_storage_write_rows(&frame, &schema, &message_descriptor))
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to join storage write encoding task: {}", err))?
 }
 
 fn supports_storage_write_schema(schema: &TableSchema) -> bool {

@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{RwLock, Semaphore};
+use tokio::task;
 use tracing::warn;
 
 #[derive(Clone)]
@@ -57,6 +58,8 @@ struct CdcCommitTableWork {
     delete_rows: Vec<TableRow>,
     truncate: bool,
 }
+
+const CDC_FRAME_BUILD_BLOCKING_ROWS: usize = 512;
 
 impl CdcTableInfo {
     pub fn new(spec: CdcTableSpec, etl_schema: &etl::types::TableSchema) -> Result<Self> {
@@ -150,23 +153,17 @@ impl EtlBigQueryDestination {
     async fn write_rows(
         &self,
         info: &CdcTableInfo,
-        rows: &[TableRow],
+        rows: Vec<TableRow>,
         mode: WriteMode,
         synced_at: DateTime<Utc>,
         deleted_at_override: Option<DateTime<Utc>>,
     ) -> EtlResult<()> {
-        if rows.is_empty() {
+        let row_count = rows.len();
+        if row_count == 0 {
             return Ok(());
         }
         self.ensure_table(info).await?;
-        let frame =
-            table_rows_to_frame(info, rows, synced_at, deleted_at_override).map_err(|err| {
-                etl::etl_error!(
-                    ErrorKind::ConversionError,
-                    "failed to build CDC batch",
-                    err.to_string()
-                )
-            })?;
+        let frame = build_cdc_frame(info.clone(), rows, synced_at, deleted_at_override).await?;
         let load_start = Instant::now();
         self.inner
             .write_batch(
@@ -186,19 +183,19 @@ impl EtlBigQueryDestination {
             })?;
         if let Some(stats) = &self.stats {
             let deleted = if deleted_at_override.is_some() {
-                rows.len()
+                row_count
             } else {
                 0
             };
             let upserted = if matches!(mode, WriteMode::Upsert) {
-                rows.len()
+                row_count
             } else {
                 0
             };
             stats
                 .record_load(
                     &info.source_name,
-                    rows.len(),
+                    row_count,
                     upserted,
                     deleted,
                     load_start.elapsed().as_millis() as u64,
@@ -215,7 +212,17 @@ impl EtlBigQueryDestination {
         delete_synced_at: DateTime<Utc>,
     ) -> EtlResult<()> {
         let info = self.get_table(work.table_id).await?;
+        self.apply_table_work(&info, work, synced_at, delete_synced_at)
+            .await
+    }
 
+    async fn apply_table_work(
+        &self,
+        info: &CdcTableInfo,
+        work: CdcCommitTableWork,
+        synced_at: DateTime<Utc>,
+        delete_synced_at: DateTime<Utc>,
+    ) -> EtlResult<()> {
         if work.truncate
             && let Err(err) = self.inner.truncate_table(&info.dest_name).await
         {
@@ -227,14 +234,14 @@ impl EtlBigQueryDestination {
         }
 
         if !work.rows.is_empty() {
-            self.write_rows(&info, &work.rows, WriteMode::Upsert, synced_at, None)
+            self.write_rows(info, work.rows, WriteMode::Upsert, synced_at, None)
                 .await?;
         }
 
         if !work.delete_rows.is_empty() {
             self.write_rows(
-                &info,
-                &work.delete_rows,
+                info,
+                work.delete_rows,
                 WriteMode::Upsert,
                 delete_synced_at,
                 Some(delete_synced_at),
@@ -315,6 +322,76 @@ impl EtlBigQueryDestination {
 
         Ok(())
     }
+
+    pub async fn write_table_events(&self, table_id: TableId, events: Vec<Event>) -> EtlResult<()> {
+        let info = self.get_table(table_id).await?;
+        let mut work = CdcCommitTableWork {
+            table_id,
+            rows: Vec::new(),
+            delete_rows: Vec::new(),
+            truncate: false,
+        };
+
+        for event in events {
+            match event {
+                Event::Insert(insert_event) => {
+                    if insert_event.table_id != table_id {
+                        return Err(etl::etl_error!(
+                            ErrorKind::DestinationError,
+                            "received mixed-table CDC insert batch"
+                        ));
+                    }
+                    work.rows.push(insert_event.table_row);
+                }
+                Event::Update(update_event) => {
+                    if update_event.table_id != table_id {
+                        return Err(etl::etl_error!(
+                            ErrorKind::DestinationError,
+                            "received mixed-table CDC update batch"
+                        ));
+                    }
+                    work.rows.push(update_event.table_row);
+                }
+                Event::Delete(delete_event) => {
+                    if delete_event.table_id != table_id {
+                        return Err(etl::etl_error!(
+                            ErrorKind::DestinationError,
+                            "received mixed-table CDC delete batch"
+                        ));
+                    }
+                    if !info.soft_delete {
+                        continue;
+                    }
+                    if let Some((_, old_row)) = delete_event.old_table_row {
+                        work.delete_rows.push(old_row);
+                    } else {
+                        warn!(
+                            table = %info.source_name,
+                            "skipping delete event without primary key"
+                        );
+                    }
+                }
+                Event::Truncate(truncate_event) => {
+                    if !truncate_event
+                        .rel_ids
+                        .iter()
+                        .any(|rel_id| TableId::new(*rel_id) == table_id)
+                    {
+                        return Err(etl::etl_error!(
+                            ErrorKind::DestinationError,
+                            "received mixed-table CDC truncate batch"
+                        ));
+                    }
+                    work.truncate = true;
+                }
+                Event::Begin(_) | Event::Commit(_) | Event::Relation(_) | Event::Unsupported => {}
+            }
+        }
+
+        let synced_at = Utc::now();
+        self.apply_table_work(&info, work, synced_at, synced_at)
+            .await
+    }
 }
 
 impl EtlDestination for EtlBigQueryDestination {
@@ -343,7 +420,7 @@ impl EtlDestination for EtlBigQueryDestination {
     ) -> EtlResult<()> {
         let info = self.get_table(table_id).await?;
         let synced_at = Utc::now();
-        self.write_rows(&info, &table_rows, WriteMode::Append, synced_at, None)
+        self.write_rows(&info, table_rows, WriteMode::Append, synced_at, None)
             .await
     }
 
@@ -408,6 +485,27 @@ impl EtlDestination for EtlBigQueryDestination {
 
         Ok(())
     }
+}
+
+async fn build_cdc_frame(
+    info: CdcTableInfo,
+    rows: Vec<TableRow>,
+    synced_at: DateTime<Utc>,
+    deleted_at_override: Option<DateTime<Utc>>,
+) -> EtlResult<DataFrame> {
+    if rows.len() < CDC_FRAME_BUILD_BLOCKING_ROWS {
+        return table_rows_to_frame(&info, &rows, synced_at, deleted_at_override);
+    }
+
+    task::spawn_blocking(move || table_rows_to_frame(&info, &rows, synced_at, deleted_at_override))
+        .await
+        .map_err(|err| {
+            etl::etl_error!(
+                ErrorKind::DestinationError,
+                "failed to join CDC frame build task",
+                err.to_string()
+            )
+        })?
 }
 
 fn table_rows_to_frame(

@@ -27,6 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use token_source::{TokenSource, TokenSourceProvider};
 use tokio::sync::Mutex;
+use tokio::task;
 use tracing::{error, info, warn};
 use url::Url;
 use uuid::Uuid;
@@ -53,6 +54,8 @@ pub struct DestinationTableSummary {
     pub max_synced_at: Option<DateTime<Utc>>,
     pub deleted_rows: i64,
 }
+
+const INSERT_ALL_BLOCKING_ROWS: usize = 512;
 
 impl BigQueryDestination {
     pub async fn new(
@@ -436,7 +439,7 @@ impl BigQueryDestination {
             return Ok(());
         }
 
-        let rows = dataframe_to_json_rows(frame)?;
+        let rows = insert_all_rows(frame).await?;
         let mut request: InsertAllRequest<Map<String, Value>> = InsertAllRequest::default();
         for row in rows {
             let insert_id = primary_key
@@ -674,6 +677,17 @@ impl Destination for BigQueryDestination {
         }
         Ok(())
     }
+}
+
+async fn insert_all_rows(frame: &DataFrame) -> Result<Vec<Map<String, Value>>> {
+    if frame.height() < INSERT_ALL_BLOCKING_ROWS {
+        return dataframe_to_json_rows(frame);
+    }
+
+    let frame = frame.clone();
+    task::spawn_blocking(move || dataframe_to_json_rows(&frame))
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to join insertAll row conversion task: {}", err))?
 }
 
 fn upsert_staging_table_id(table: &str) -> String {

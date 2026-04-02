@@ -179,7 +179,10 @@ pub(super) fn cdc_slot_name(connection_id: &str, pipeline_id: Option<u64>) -> Re
 
     let slot_name = format!("cdsync_{}_cdc", normalized);
     if slot_name.len() > 63 {
-        anyhow::bail!("CDC replication slot name {} exceeds postgres limit", slot_name);
+        anyhow::bail!(
+            "CDC replication slot name {} exceeds postgres limit",
+            slot_name
+        );
     }
     Ok(slot_name)
 }
@@ -227,6 +230,7 @@ impl PostgresSource {
             .or(self.config.batch_size)
             .unwrap_or(default_batch_size);
         let snapshot_concurrency = snapshot_concurrency.max(1);
+        let cdc_apply_concurrency = self.config.cdc_apply_concurrency(snapshot_concurrency);
         let max_pending_events = self.config.cdc_max_pending_events.unwrap_or(100_000);
         let idle_timeout = Duration::from_secs(self.config.cdc_idle_timeout_seconds.unwrap_or(10));
 
@@ -353,7 +357,7 @@ impl PostgresSource {
             dest.clone(),
             table_info_map.clone(),
             stats.clone(),
-            snapshot_concurrency,
+            cdc_apply_concurrency,
         );
 
         let slot_name = cdc_slot_name(
@@ -777,7 +781,7 @@ impl PostgresSource {
                     pipeline_id: stream_pipeline_id,
                     idle_timeout,
                     max_pending_events,
-                    apply_concurrency: snapshot_concurrency,
+                    apply_concurrency: cdc_apply_concurrency,
                     follow,
                     shutdown: shutdown.clone(),
                 },
@@ -977,10 +981,11 @@ impl PostgresSource {
         tables: &[ResolvedPostgresTable],
     ) -> Result<()> {
         let publication_sql = quote_pg_identifier(publication);
-        let exists: bool = sqlx::query_scalar("select exists(select 1 from pg_publication where pubname = $1)")
-            .bind(publication)
-            .fetch_one(&self.pool)
-            .await?;
+        let exists: bool =
+            sqlx::query_scalar("select exists(select 1 from pg_publication where pubname = $1)")
+                .bind(publication)
+                .fetch_one(&self.pool)
+                .await?;
         if !exists {
             sqlx::query(&format!("create publication {};", publication_sql))
                 .execute(&self.pool)

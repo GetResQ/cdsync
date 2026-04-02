@@ -147,6 +147,7 @@ fn test_config() -> Config {
                 schema_changes: Some(crate::config::SchemaChangePolicy::Auto),
                 cdc_pipeline_id: Some(1),
                 cdc_batch_size: Some(1000),
+                cdc_apply_concurrency: Some(8),
                 cdc_max_fill_ms: Some(2000),
                 cdc_max_pending_events: Some(100_000),
                 cdc_idle_timeout_seconds: Some(10),
@@ -448,7 +449,11 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
     assert_eq!(connections_json[0]["last_sync_status"], "success");
     assert_eq!(connections_json[0]["phase"], "healthy");
     assert_eq!(connections_json[0]["reason_code"], "healthy");
-    assert!(connections_json[0]["max_checkpoint_age_seconds"].as_i64().is_some());
+    assert!(
+        connections_json[0]["max_checkpoint_age_seconds"]
+            .as_i64()
+            .is_some()
+    );
 
     let connection = client
         .get(format!("{base_url}/v1/connections/app"))
@@ -474,7 +479,11 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
     assert_eq!(runtime_json["reason_code"], "healthy");
     assert_eq!(runtime_json["config_hash"], "config-hash");
     assert_eq!(runtime_json["deploy_revision"], "deploy-123");
-    assert!(runtime_json["max_checkpoint_age_seconds"].as_i64().is_some());
+    assert!(
+        runtime_json["max_checkpoint_age_seconds"]
+            .as_i64()
+            .is_some()
+    );
 
     let progress = client
         .get(format!("{base_url}/v1/connections/app/progress"))
@@ -493,7 +502,11 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
     assert_eq!(progress_json["tables"][0]["stats"]["rows_written"], 10);
     assert_eq!(progress_json["tables"][0]["phase"], "healthy");
     assert_eq!(progress_json["tables"][0]["reason_code"], "healthy");
-    assert!(progress_json["tables"][0]["checkpoint_age_seconds"].as_i64().is_some());
+    assert!(
+        progress_json["tables"][0]["checkpoint_age_seconds"]
+            .as_i64()
+            .is_some()
+    );
     assert!(progress_json["tables"][0]["lag_seconds"].as_i64().is_some());
 
     let tables = client
