@@ -71,6 +71,10 @@ use self::table_selection::*;
 
 type CdcApplyFuture = Pin<Box<dyn Future<Output = Result<CdcApplyFragmentAck>> + Send>>;
 
+pub(crate) fn admin_cdc_slot_name(connection_id: &str, pipeline_id: Option<u64>) -> Result<String> {
+    cdc_sync::cdc_slot_name(connection_id, pipeline_id)
+}
+
 pub struct PostgresSource {
     config: PostgresConfig,
     metadata: MetadataColumns,

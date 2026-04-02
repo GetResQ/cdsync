@@ -24,11 +24,15 @@ use jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER as JWT_CRYPTO_PROVIDER;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::Row;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
+use tracing::warn;
 use url::Url;
 
 #[derive(Clone)]
@@ -495,6 +499,23 @@ struct RunsQuery {
     limit: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
+struct RuntimeMetadata<'a> {
+    config_hash: &'a str,
+    deploy_revision: Option<&'a str>,
+    last_restart_reason: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostgresCdcRuntimeState {
+    Following,
+    Initializing,
+    ContinuityLost,
+    Unknown,
+}
+
+const CDC_SLOT_INSPECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 fn config_hash(cfg: &Config) -> anyhow::Result<String> {
     let mut value = serde_json::to_value(cfg).context("serializing config for hashing")?;
     canonicalize_json_value(&mut value);
@@ -630,36 +651,36 @@ async fn connections(
 ) -> Result<Json<Vec<ConnectionSummary>>, AdminApiError> {
     let sync_state = state.state_store.load_state().await?;
     let now = Utc::now();
-    let items = state
-        .cfg
-        .connections
-        .iter()
-        .map(|connection| {
-            let current = sync_state.connections.get(&connection.id);
-            let runtime = derive_connection_runtime(
-                connection,
-                current,
-                None,
-                now,
-                &state.config_hash,
-                state.deploy_revision.as_deref(),
-                &state.last_restart_reason,
-            );
-            ConnectionSummary {
-                id: connection.id.clone(),
-                enabled: connection.enabled(),
-                source_kind: source_kind(&connection.source),
-                destination_kind: destination_kind(&connection.destination),
-                last_sync_started_at: current.and_then(|c| c.last_sync_started_at),
-                last_sync_finished_at: current.and_then(|c| c.last_sync_finished_at),
-                last_sync_status: current.and_then(|c| c.last_sync_status.clone()),
-                last_error: current.and_then(|c| c.last_error.clone()),
-                phase: runtime.phase,
-                reason_code: runtime.reason_code,
-                max_checkpoint_age_seconds: runtime.max_checkpoint_age_seconds,
-            }
-        })
-        .collect();
+    let mut items = Vec::with_capacity(state.cfg.connections.len());
+    for connection in &state.cfg.connections {
+        let current = sync_state.connections.get(&connection.id);
+        let cdc_runtime_state = load_postgres_cdc_runtime_state(connection, current).await;
+        let runtime = derive_connection_runtime(
+            connection,
+            current,
+            None,
+            cdc_runtime_state,
+            now,
+            RuntimeMetadata {
+                config_hash: &state.config_hash,
+                deploy_revision: state.deploy_revision.as_deref(),
+                last_restart_reason: &state.last_restart_reason,
+            },
+        );
+        items.push(ConnectionSummary {
+            id: connection.id.clone(),
+            enabled: connection.enabled(),
+            source_kind: source_kind(&connection.source),
+            destination_kind: destination_kind(&connection.destination),
+            last_sync_started_at: current.and_then(|c| c.last_sync_started_at),
+            last_sync_finished_at: current.and_then(|c| c.last_sync_finished_at),
+            last_sync_status: current.and_then(|c| c.last_sync_status.clone()),
+            last_error: current.and_then(|c| c.last_error.clone()),
+            phase: runtime.phase,
+            reason_code: runtime.reason_code,
+            max_checkpoint_age_seconds: runtime.max_checkpoint_age_seconds,
+        });
+    }
     Ok(Json(items))
 }
 
@@ -716,14 +737,19 @@ async fn connection_runtime(
         .iter()
         .find(|connection| connection.id == connection_id)
         .context("connection not found")?;
+    let cdc_runtime_state =
+        load_postgres_cdc_runtime_state(connection, sync_state.connections.get(&connection_id)).await;
     let runtime = derive_connection_runtime(
         connection,
         sync_state.connections.get(&connection_id),
         None,
+        cdc_runtime_state,
         Utc::now(),
-        &state.config_hash,
-        state.deploy_revision.as_deref(),
-        &state.last_restart_reason,
+        RuntimeMetadata {
+            config_hash: &state.config_hash,
+            deploy_revision: state.deploy_revision.as_deref(),
+            last_restart_reason: &state.last_restart_reason,
+        },
     );
     Ok(Json(runtime))
 }
@@ -752,14 +778,18 @@ async fn progress(
         (None, Vec::new())
     };
     let now = Utc::now();
+    let cdc_runtime_state = load_postgres_cdc_runtime_state(config, connection_state.as_ref()).await;
     let runtime = derive_connection_runtime(
         config,
         connection_state.as_ref(),
         current_run.as_ref(),
+        cdc_runtime_state,
         now,
-        &state.config_hash,
-        state.deploy_revision.as_deref(),
-        &state.last_restart_reason,
+        RuntimeMetadata {
+            config_hash: &state.config_hash,
+            deploy_revision: state.deploy_revision.as_deref(),
+            last_restart_reason: &state.last_restart_reason,
+        },
     );
     let tables = build_table_progress(
         config,
@@ -767,6 +797,7 @@ async fn progress(
         &run_tables,
         now,
         runtime.reason_code,
+        cdc_runtime_state,
     );
 
     Ok(Json(ProgressResponse {
@@ -800,14 +831,18 @@ async fn connection_tables(
     } else {
         Vec::new()
     };
+    let cdc_runtime_state = load_postgres_cdc_runtime_state(config, connection_state.as_ref()).await;
     let runtime = derive_connection_runtime(
         config,
         connection_state.as_ref(),
         None,
+        cdc_runtime_state,
         Utc::now(),
-        &state.config_hash,
-        state.deploy_revision.as_deref(),
-        &state.last_restart_reason,
+        RuntimeMetadata {
+            config_hash: &state.config_hash,
+            deploy_revision: state.deploy_revision.as_deref(),
+            last_restart_reason: &state.last_restart_reason,
+        },
     );
     Ok(Json(build_table_progress(
         config,
@@ -815,6 +850,7 @@ async fn connection_tables(
         &run_tables,
         Utc::now(),
         runtime.reason_code,
+        cdc_runtime_state,
     )))
 }
 
@@ -881,6 +917,97 @@ fn classify_error_reason(error: Option<&str>) -> &'static str {
     }
 }
 
+async fn load_postgres_cdc_runtime_state(
+    connection: &ConnectionConfig,
+    state: Option<&ConnectionState>,
+) -> Option<PostgresCdcRuntimeState> {
+    let SourceConfig::Postgres(pg) = &connection.source else {
+        return None;
+    };
+    if !pg.cdc.unwrap_or(true) {
+        return None;
+    }
+
+    let slot_name = state
+        .and_then(|state| state.postgres_cdc.as_ref())
+        .and_then(|cdc_state| cdc_state.slot_name.clone())
+        .or_else(|| {
+            crate::sources::postgres::admin_cdc_slot_name(&connection.id, pg.cdc_pipeline_id).ok()
+        });
+    let has_last_lsn = state
+        .and_then(|state| state.postgres_cdc.as_ref())
+        .and_then(|cdc_state| cdc_state.last_lsn.as_ref())
+        .is_some();
+
+    let Some(slot_name) = slot_name else {
+        return Some(PostgresCdcRuntimeState::Initializing);
+    };
+
+    let pool = match PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(CDC_SLOT_INSPECTION_TIMEOUT)
+        .connect_lazy(&pg.url)
+    {
+        Ok(pool) => pool,
+        Err(err) => {
+            warn!(
+                connection = %connection.id,
+                error = %err,
+                "failed to inspect postgres CDC slot state"
+            );
+            return Some(PostgresCdcRuntimeState::Unknown);
+        }
+    };
+
+    let row = match timeout(
+        CDC_SLOT_INSPECTION_TIMEOUT,
+        sqlx::query(
+            r#"
+            select active
+            from pg_replication_slots
+            where slot_type = 'logical'
+              and slot_name = $1
+            "#,
+        )
+        .bind(&slot_name)
+        .fetch_optional(&pool),
+    )
+    .await
+    {
+        Ok(Ok(row)) => row,
+        Ok(Err(err)) => {
+            warn!(
+                connection = %connection.id,
+                slot_name = %slot_name,
+                error = %err,
+                "failed to query postgres CDC slot state"
+            );
+            return Some(PostgresCdcRuntimeState::Unknown);
+        }
+        Err(_) => {
+            warn!(
+                connection = %connection.id,
+                slot_name = %slot_name,
+                "timed out while inspecting postgres CDC slot state"
+            );
+            return Some(PostgresCdcRuntimeState::Unknown);
+        }
+    };
+
+    match row {
+        Some(row) => {
+            let active: bool = row.try_get("active").unwrap_or(false);
+            if active {
+                Some(PostgresCdcRuntimeState::Following)
+            } else {
+                Some(PostgresCdcRuntimeState::Initializing)
+            }
+        }
+        None if has_last_lsn => Some(PostgresCdcRuntimeState::ContinuityLost),
+        None => Some(PostgresCdcRuntimeState::Initializing),
+    }
+}
+
 fn checkpoint_has_incomplete_snapshot(checkpoint: Option<&TableCheckpoint>) -> bool {
     checkpoint.is_some_and(|checkpoint| {
         !checkpoint.snapshot_chunks.is_empty()
@@ -892,10 +1019,9 @@ fn derive_connection_runtime(
     connection: &ConnectionConfig,
     state: Option<&ConnectionState>,
     _current_run: Option<&RunSummary>,
+    cdc_runtime_state: Option<PostgresCdcRuntimeState>,
     now: DateTime<Utc>,
-    config_hash: &str,
-    deploy_revision: Option<&str>,
-    last_restart_reason: &str,
+    metadata: RuntimeMetadata<'_>,
 ) -> ConnectionRuntime {
     let (phase, reason_code) = match state.and_then(|state| state.last_sync_status.as_deref()) {
         Some("running") if state.is_some_and(|state| {
@@ -903,12 +1029,13 @@ fn derive_connection_runtime(
                 .values()
                 .any(|checkpoint| checkpoint_has_incomplete_snapshot(Some(checkpoint)))
         }) => ("snapshotting", "snapshot_in_progress"),
-        Some("running")
-            if matches!(&connection.source, SourceConfig::Postgres(pg) if pg.cdc.unwrap_or(true)) =>
-        {
-            ("running", "cdc_following")
-        }
-        Some("running") => ("syncing", "sync_in_progress"),
+        Some("running") => match cdc_runtime_state {
+            Some(PostgresCdcRuntimeState::Following) => ("running", "cdc_following"),
+            Some(PostgresCdcRuntimeState::ContinuityLost) => ("blocked", "cdc_continuity_lost"),
+            Some(PostgresCdcRuntimeState::Unknown) => ("starting", "cdc_state_unknown"),
+            Some(PostgresCdcRuntimeState::Initializing) => ("starting", "cdc_initializing"),
+            None => ("syncing", "sync_in_progress"),
+        },
         Some("failed") => {
             let reason = classify_error_reason(state.and_then(|state| state.last_error.as_deref()));
             if matches!(reason, "schema_blocked" | "publication_blocked") {
@@ -930,9 +1057,9 @@ fn derive_connection_runtime(
         last_sync_status: state.and_then(|state| state.last_sync_status.clone()),
         last_error: state.and_then(|state| state.last_error.clone()),
         max_checkpoint_age_seconds: max_checkpoint_age_seconds(state, connection, now),
-        config_hash: config_hash.to_string(),
-        deploy_revision: deploy_revision.map(ToOwned::to_owned),
-        last_restart_reason: last_restart_reason.to_string(),
+        config_hash: metadata.config_hash.to_string(),
+        deploy_revision: metadata.deploy_revision.map(ToOwned::to_owned),
+        last_restart_reason: metadata.last_restart_reason.to_string(),
     }
 }
 
@@ -942,6 +1069,7 @@ fn build_table_progress(
     run_tables: &[TableStatsSnapshot],
     now: DateTime<Utc>,
     connection_reason_code: &'static str,
+    cdc_runtime_state: Option<PostgresCdcRuntimeState>,
 ) -> Vec<TableProgress> {
     let mut table_names = configured_entity_names(connection);
     if let Some(state) = state {
@@ -988,12 +1116,17 @@ fn build_table_progress(
                 Some("running") if checkpoint_has_incomplete_snapshot(checkpoint.as_ref()) => {
                     ("snapshotting", "snapshot_in_progress")
                 }
-                Some("running")
-                    if matches!(&connection.source, SourceConfig::Postgres(pg) if pg.cdc.unwrap_or(true)) =>
-                {
-                    ("running", "cdc_following")
-                }
-                Some("running") => ("syncing", "sync_in_progress"),
+                Some("running") => match cdc_runtime_state {
+                    Some(PostgresCdcRuntimeState::Following) => ("running", "cdc_following"),
+                    Some(PostgresCdcRuntimeState::ContinuityLost) => {
+                        ("blocked", "cdc_continuity_lost")
+                    }
+                    Some(PostgresCdcRuntimeState::Unknown) => ("pending", "cdc_state_unknown"),
+                    Some(PostgresCdcRuntimeState::Initializing) => {
+                        ("pending", "cdc_initializing")
+                    }
+                    None => ("syncing", "sync_in_progress"),
+                },
                 Some("success") if checkpoint.is_some() => ("healthy", "healthy"),
                 _ => ("pending", "never_synced"),
             };
@@ -1430,5 +1563,99 @@ mod tests {
             max_checkpoint_age_seconds(Some(&state), &connection, now),
             Some(60)
         );
+    }
+
+    fn test_postgres_cdc_connection() -> ConnectionConfig {
+        ConnectionConfig {
+            id: "app_staging".to_string(),
+            enabled: Some(true),
+            source: SourceConfig::Postgres(PostgresConfig {
+                url: "postgres://postgres:secret@example.com:5432/app".to_string(),
+                tables: Some(vec![PostgresTableConfig {
+                    name: "public.accounts".to_string(),
+                    primary_key: Some("id".to_string()),
+                    updated_at_column: Some("updated_at".to_string()),
+                    soft_delete: Some(false),
+                    soft_delete_column: None,
+                    where_clause: None,
+                    columns: None,
+                }]),
+                table_selection: None,
+                batch_size: Some(1000),
+                cdc: Some(true),
+                publication: Some("cdsync_pub".to_string()),
+                schema_changes: Some(crate::config::SchemaChangePolicy::Auto),
+                cdc_pipeline_id: Some(1101),
+                cdc_batch_size: Some(1000),
+                cdc_max_fill_ms: Some(2000),
+                cdc_max_pending_events: Some(100_000),
+                cdc_idle_timeout_seconds: Some(10),
+                cdc_tls: Some(false),
+                cdc_tls_ca_path: None,
+                cdc_tls_ca: None,
+            }),
+            destination: DestinationConfig::BigQuery(BigQueryConfig {
+                project_id: "proj".to_string(),
+                dataset: "dataset".to_string(),
+                location: Some("US".to_string()),
+                service_account_key_path: None,
+                service_account_key: None,
+                partition_by_synced_at: Some(true),
+                storage_write_enabled: Some(false),
+                batch_load_bucket: None,
+                batch_load_prefix: None,
+                emulator_http: Some("http://localhost:9050".to_string()),
+                emulator_grpc: Some("localhost:9051".to_string()),
+            }),
+            schedule: None,
+        }
+    }
+
+    #[test]
+    fn derive_connection_runtime_requires_real_cdc_follow_state() {
+        let connection = test_postgres_cdc_connection();
+        let state = ConnectionState {
+            last_sync_status: Some("running".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = derive_connection_runtime(
+            &connection,
+            Some(&state),
+            None,
+            Some(PostgresCdcRuntimeState::Initializing),
+            Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).unwrap(),
+            RuntimeMetadata {
+                config_hash: "hash",
+                deploy_revision: Some("deploy"),
+                last_restart_reason: "startup",
+            },
+        );
+
+        assert_eq!(runtime.phase, "starting");
+        assert_eq!(runtime.reason_code, "cdc_initializing");
+    }
+
+    #[test]
+    fn build_table_progress_requires_real_cdc_follow_state() {
+        let connection = test_postgres_cdc_connection();
+        let state = ConnectionState {
+            last_sync_status: Some("running".to_string()),
+            ..Default::default()
+        };
+
+        let tables = build_table_progress(
+            &connection,
+            Some(&state),
+            &[],
+            Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).unwrap(),
+            "cdc_initializing",
+            Some(PostgresCdcRuntimeState::Initializing),
+        );
+
+        assert!(!tables.is_empty());
+        assert!(tables
+            .iter()
+            .all(|table| table.reason_code == "cdc_initializing"));
     }
 }
