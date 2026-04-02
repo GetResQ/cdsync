@@ -44,6 +44,17 @@ fn maps_array_and_range_types_to_json() {
 }
 
 #[test]
+fn snapshot_shutdown_requested_tracks_signal_state() {
+    let (controller, signal) = crate::runner::ShutdownController::new();
+    assert!(!super::snapshot_sync::snapshot_shutdown_requested(Some(&signal)));
+
+    controller.shutdown();
+
+    assert!(super::snapshot_sync::snapshot_shutdown_requested(Some(&signal)));
+    assert!(!super::snapshot_sync::snapshot_shutdown_requested(None));
+}
+
+#[test]
 fn rejects_multirange_and_builtin_unsupported_types() {
     assert!(pg_type_to_data_type_from_type(&etl::types::Type::INT4MULTI_RANGE).is_err());
     assert!(pg_type_to_data_type_from_type(&etl::types::Type::XID8).is_err());

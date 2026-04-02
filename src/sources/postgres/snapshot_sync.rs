@@ -567,6 +567,7 @@ impl PostgresSource {
             resume_from_primary_key,
             write_mode,
             state_handle,
+            shutdown,
         } = ctx;
         let (schema_name, table_name) = split_table_name(&table.name);
         let table_ref = format!(
@@ -625,6 +626,16 @@ impl PostgresSource {
 
         let run_result: Result<()> = async {
             loop {
+                if snapshot_shutdown_requested(shutdown.as_ref()) {
+                    info!(
+                        table = %table.name,
+                        snapshot_name = snapshot_label,
+                        chunk_start,
+                        chunk_end,
+                        "shutdown requested before starting next exported snapshot batch"
+                    );
+                    break;
+                }
                 let extract_start = Instant::now();
                 let rows = if let Some(last_pk_value) = last_pk.as_ref() {
                     let query = if has_filters {
@@ -712,6 +723,19 @@ impl PostgresSource {
                     state_handle.as_ref(),
                 )
                 .await?;
+
+                if snapshot_shutdown_requested(shutdown.as_ref()) {
+                    info!(
+                        table = %table.name,
+                        extracted_rows,
+                        loaded_batches,
+                        snapshot_name = snapshot_label,
+                        chunk_start,
+                        chunk_end,
+                        "shutdown requested after exported snapshot batch checkpoint"
+                    );
+                    break;
+                }
             }
 
             completed = true;
@@ -920,4 +944,8 @@ pub(super) async fn save_snapshot_progress(
             .await?;
     }
     Ok(())
+}
+
+pub(super) fn snapshot_shutdown_requested(shutdown: Option<&ShutdownSignal>) -> bool {
+    shutdown.is_some_and(ShutdownSignal::is_shutdown)
 }

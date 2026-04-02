@@ -586,6 +586,7 @@ impl PostgresSource {
             for snapshot_task in snapshot_tasks_to_run {
                 let permit_pool = Arc::clone(&semaphore);
                 let snapshot_name = snapshot_name.clone();
+                let task_shutdown = shutdown.clone();
                 let source = self;
                 let dest = dest.clone();
                 let stats = stats.clone();
@@ -622,6 +623,7 @@ impl PostgresSource {
                                 resume_from_primary_key: snapshot_task.resume_from_primary_key,
                                 write_mode: snapshot_task.write_mode,
                                 state_handle: snapshot_task.state_handle,
+                                shutdown: task_shutdown,
                             },
                         )
                         .await

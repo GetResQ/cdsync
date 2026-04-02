@@ -105,6 +105,7 @@ struct SnapshotCopyContext<'a> {
     resume_from_primary_key: Option<String>,
     write_mode: WriteMode,
     state_handle: Option<StateHandle>,
+    shutdown: Option<ShutdownSignal>,
 }
 
 const DEFAULT_PG_POOL_MAX: u32 = 5;
