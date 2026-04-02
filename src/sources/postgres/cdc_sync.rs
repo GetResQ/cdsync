@@ -375,6 +375,19 @@ impl PostgresSource {
         let initial_snapshot_tables =
             initial_snapshot_table_ids(&table_ids, state, last_lsn.as_deref());
         let snapshot_progress_tables = snapshot_progress_table_ids(&table_ids, state);
+        info!(
+            connection = %state_handle
+                .as_ref()
+                .map(|handle| handle.connection_id())
+                .unwrap_or("postgres"),
+            include_table_count = include_tables.len(),
+            resync_table_count = resync_tables.len(),
+            initial_snapshot_table_count = initial_snapshot_tables.len(),
+            snapshot_progress_table_count = snapshot_progress_tables.len(),
+            last_lsn = last_lsn.as_deref().unwrap_or("<none>"),
+            slot_name = %slot_name,
+            "resolved CDC snapshot inputs"
+        );
 
         let has_snapshot_progress = !snapshot_progress_tables.is_empty();
         let mut snapshot_progress_missing_lsn = false;
@@ -420,6 +433,19 @@ impl PostgresSource {
         if !resync_tables.is_empty() || !initial_snapshot_tables.is_empty() {
             needs_snapshot = true;
         }
+        info!(
+            connection = %state_handle
+                .as_ref()
+                .map(|handle| handle.connection_id())
+                .unwrap_or("postgres"),
+            mode = ?mode,
+            needs_snapshot,
+            has_snapshot_progress,
+            force_snapshot_restart,
+            preserve_existing_backlog,
+            last_lsn = last_lsn.as_deref().unwrap_or("<none>"),
+            "computed CDC snapshot decision"
+        );
 
         if needs_snapshot {
             let snapshot_table_ids = snapshot_table_ids(
@@ -430,6 +456,18 @@ impl PostgresSource {
                 mode,
                 last_lsn.as_deref(),
                 preserve_existing_backlog,
+            );
+            info!(
+                connection = %state_handle
+                    .as_ref()
+                    .map(|handle| handle.connection_id())
+                    .unwrap_or("postgres"),
+                snapshot_table_count = snapshot_table_ids.len(),
+                snapshot_table_names = ?snapshot_table_ids
+                    .iter()
+                    .filter_map(|table_id| table_ids.get(table_id).map(|table| table.name.as_str()))
+                    .collect::<Vec<_>>(),
+                "selected tables for CDC snapshot planning"
             );
 
             let resume_snapshot_run = snapshot_resume_lsn.is_some() && !force_snapshot_restart;
@@ -554,6 +592,19 @@ impl PostgresSource {
                         snapshot_resume_tasks_from_checkpoint(entry)?,
                     )
                 };
+                info!(
+                    table = %info.source_name,
+                    snapshot_task_count = task_specs.len(),
+                    resume_snapshot_run,
+                    resumed_from_saved_progress,
+                    is_initial_snapshot_table = initial_snapshot_tables.contains(table_id),
+                    is_resync_table = resync_tables.contains(table_id),
+                    write_mode = match write_mode {
+                        WriteMode::Append => "append",
+                        WriteMode::Upsert => "upsert",
+                    },
+                    "planned CDC snapshot work for table"
+                );
                 let checkpoint_state = Arc::new(Mutex::new(
                     state
                         .postgres
@@ -694,6 +745,15 @@ impl PostgresSource {
                 start_lsn = Some(parsed_start_lsn);
                 last_lsn = Some(snapshot_start_lsn);
             }
+        } else {
+            info!(
+                connection = %state_handle
+                    .as_ref()
+                    .map(|handle| handle.connection_id())
+                    .unwrap_or("postgres"),
+                last_lsn = last_lsn.as_deref().unwrap_or("<none>"),
+                "skipping CDC snapshot planning because snapshot is not needed"
+            );
         }
 
         let start_lsn = match (start_lsn, last_lsn.as_deref()) {
