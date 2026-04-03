@@ -8,7 +8,9 @@ use crate::config::{
 };
 use crate::runner::ShutdownSignal;
 use crate::state::{ConnectionState, SyncState, SyncStateStore};
-use crate::stats::{RunStatsSnapshot, RunSummary, StatsDb, TableStatsSnapshot, live_run_snapshot, summarize_run};
+use crate::stats::{
+    RunStatsSnapshot, RunSummary, StatsDb, TableStatsSnapshot, live_run_snapshot, summarize_run,
+};
 use crate::types::TableCheckpoint;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -29,9 +31,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::postgres::PgPoolOptions;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1179,7 +1181,11 @@ async fn load_current_run_view(
     Option<RunStatsSnapshot>,
 )> {
     if let Some(snapshot) = live_run_snapshot(connection_id) {
-        return Ok((Some(summarize_run(&snapshot)), snapshot.tables.clone(), Some(snapshot)));
+        return Ok((
+            Some(summarize_run(&snapshot)),
+            snapshot.tables.clone(),
+            Some(snapshot),
+        ));
     }
 
     if let Some(stats_db) = &state.stats_db {
@@ -2259,9 +2265,16 @@ mod tests {
             snapshot_chunks_complete: 2,
         };
 
-        let selected = select_active_tables(&[idle, busy.clone(), blocked.clone(), snapshotting.clone()]);
-        let names: Vec<_> = selected.iter().map(|table| table.table_name.as_str()).collect();
+        let selected =
+            select_active_tables(&[idle, busy.clone(), blocked.clone(), snapshotting.clone()]);
+        let names: Vec<_> = selected
+            .iter()
+            .map(|table| table.table_name.as_str())
+            .collect();
 
-        assert_eq!(names, vec!["public.z_busy", "public.m_blocked", "public.n_snapshot"]);
+        assert_eq!(
+            names,
+            vec!["public.z_busy", "public.m_blocked", "public.n_snapshot"]
+        );
     }
 }

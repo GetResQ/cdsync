@@ -24,10 +24,13 @@ use reqwest::StatusCode;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use token_source::{TokenSource, TokenSourceProvider};
 use tokio::sync::Mutex;
 use tokio::task;
+use tokio::time::timeout;
 use tracing::{error, info, warn};
 use url::Url;
 use uuid::Uuid;
@@ -56,6 +59,8 @@ pub struct DestinationTableSummary {
 }
 
 const INSERT_ALL_BLOCKING_ROWS: usize = 512;
+pub(super) const BIGQUERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+pub(super) const BIGQUERY_JOB_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 impl BigQueryDestination {
     pub async fn new(
@@ -193,6 +198,41 @@ impl BigQueryDestination {
         })
     }
 
+    pub(super) async fn await_with_timeout<T, E, F>(
+        label: impl Into<String>,
+        duration: Duration,
+        fut: F,
+    ) -> Result<T>
+    where
+        F: Future<Output = std::result::Result<T, E>>,
+        E: Into<anyhow::Error>,
+    {
+        let label = label.into();
+        match timeout(duration, fut).await {
+            Ok(result) => result.map_err(Into::into).with_context(|| label.clone()),
+            Err(_) => anyhow::bail!("{} timed out after {}s", label, duration.as_secs()),
+        }
+    }
+
+    async fn await_bq_timeout<T, F>(
+        label: impl Into<String>,
+        duration: Duration,
+        fut: F,
+    ) -> std::result::Result<T, BqError>
+    where
+        F: Future<Output = std::result::Result<T, BqError>>,
+    {
+        let label = label.into();
+        match timeout(duration, fut).await {
+            Ok(result) => result,
+            Err(_) => Err(BqError::HttpMiddleware(anyhow::anyhow!(
+                "{} timed out after {}s",
+                label,
+                duration.as_secs()
+            ))),
+        }
+    }
+
     async fn ensure_dataset(&self) -> Result<()> {
         if self.dry_run {
             info!("dry-run: ensure dataset {}", self.config.dataset);
@@ -204,7 +244,12 @@ impl BigQueryDestination {
                 emulator_http, self.config.project_id, self.config.dataset
             );
             let client = reqwest::Client::new();
-            let response = client.get(&url).send().await?;
+            let response = Self::await_with_timeout(
+                format!("fetching BigQuery emulator dataset {}", self.config.dataset),
+                BIGQUERY_REQUEST_TIMEOUT,
+                client.get(&url).send(),
+            )
+            .await?;
             if response.status().is_success() {
                 return Ok(());
             }
@@ -219,7 +264,12 @@ impl BigQueryDestination {
                         "datasetId": self.config.dataset
                     }
                 });
-                let response = client.post(create_url).json(&body).send().await?;
+                let response = Self::await_with_timeout(
+                    format!("creating BigQuery emulator dataset {}", self.config.dataset),
+                    BIGQUERY_REQUEST_TIMEOUT,
+                    client.post(create_url).json(&body).send(),
+                )
+                .await?;
                 if response.status().is_success() {
                     return Ok(());
                 }
@@ -234,11 +284,14 @@ impl BigQueryDestination {
             );
         }
 
-        match self
-            .client
-            .dataset()
-            .get(&self.config.project_id, &self.config.dataset)
-            .await
+        match Self::await_bq_timeout(
+            format!("fetching BigQuery dataset {}", self.config.dataset),
+            BIGQUERY_REQUEST_TIMEOUT,
+            self.client
+                .dataset()
+                .get(&self.config.project_id, &self.config.dataset),
+        )
+        .await
         {
             Ok(_) => Ok(()),
             Err(BqError::Response(err)) if err.code == 404 => {
@@ -253,7 +306,12 @@ impl BigQueryDestination {
                     dataset_id: self.config.dataset.clone(),
                 };
                 dataset.location = location;
-                self.client.dataset().create(&dataset).await?;
+                Self::await_bq_timeout(
+                    format!("creating BigQuery dataset {}", self.config.dataset),
+                    BIGQUERY_REQUEST_TIMEOUT,
+                    self.client.dataset().create(&dataset),
+                )
+                .await?;
                 Ok(())
             }
             Err(err) => Err(err.into()),
@@ -273,18 +331,25 @@ impl BigQueryDestination {
                 "{}/projects/{}/queries",
                 emulator_http, self.config.project_id
             );
-            reqwest::Client::new()
-                .post(url)
-                .json(&request)
-                .send()
-                .await?
-                .json::<QueryResponse>()
-                .await?
+            let response = Self::await_with_timeout(
+                "posting BigQuery emulator query",
+                BIGQUERY_REQUEST_TIMEOUT,
+                reqwest::Client::new().post(url).json(&request).send(),
+            )
+            .await?;
+            Self::await_with_timeout(
+                "decoding BigQuery emulator query response",
+                BIGQUERY_REQUEST_TIMEOUT,
+                response.json::<QueryResponse>(),
+            )
+            .await?
         } else {
-            self.client
-                .job()
-                .query(&self.config.project_id, &request)
-                .await?
+            Self::await_with_timeout(
+                "running BigQuery query",
+                BIGQUERY_REQUEST_TIMEOUT,
+                self.client.job().query(&self.config.project_id, &request),
+            )
+            .await?
         };
 
         if let Some(errors) = &response.errors
@@ -320,7 +385,12 @@ impl BigQueryDestination {
                 "{}/projects/{}/datasets/{}/tables/{}",
                 emulator_http, self.config.project_id, self.config.dataset, table_id
             );
-            let response = client.get(&url).send().await?;
+            let response = Self::await_with_timeout(
+                format!("fetching BigQuery emulator table {}", table_id),
+                BIGQUERY_REQUEST_TIMEOUT,
+                client.get(&url).send(),
+            )
+            .await?;
             if response.status().is_success() {
                 return Ok(());
             }
@@ -345,18 +415,26 @@ impl BigQueryDestination {
                 "{}/projects/{}/datasets/{}/tables",
                 emulator_http, self.config.project_id, self.config.dataset
             );
-            let response = client.post(create_url).json(&body).send().await?;
+            let response = Self::await_with_timeout(
+                format!("creating BigQuery emulator table {}", table_id),
+                BIGQUERY_REQUEST_TIMEOUT,
+                client.post(create_url).json(&body).send(),
+            )
+            .await?;
             if response.status().is_success() {
                 return Ok(());
             }
             anyhow::bail!("emulator table create failed: {}", response.status());
         }
 
-        match self
-            .client
-            .table()
-            .get(&self.config.project_id, &self.config.dataset, table_id)
-            .await
+        match Self::await_bq_timeout(
+            format!("fetching BigQuery table {}", table_id),
+            BIGQUERY_REQUEST_TIMEOUT,
+            self.client
+                .table()
+                .get(&self.config.project_id, &self.config.dataset, table_id),
+        )
+        .await
         {
             Ok(mut table) => {
                 let existing_fields = table
@@ -380,7 +458,12 @@ impl BigQueryDestination {
                     table.schema = Some(BqTableSchema {
                         fields: updated_fields,
                     });
-                    self.client.table().patch(&table).await?;
+                    Self::await_bq_timeout(
+                        format!("patching BigQuery table {}", table_id),
+                        BIGQUERY_REQUEST_TIMEOUT,
+                        self.client.table().patch(&table),
+                    )
+                    .await?;
                 }
                 Ok(())
             }
@@ -405,7 +488,12 @@ impl BigQueryDestination {
                     schema: Some(bq_schema),
                     ..Default::default()
                 };
-                self.client.table().create(&table).await?;
+                Self::await_bq_timeout(
+                    format!("creating BigQuery table {}", table_id),
+                    BIGQUERY_REQUEST_TIMEOUT,
+                    self.client.table().create(&table),
+                )
+                .await?;
                 Ok(())
             }
             Err(err) => Err(err.into()),
@@ -456,11 +544,12 @@ impl BigQueryDestination {
                 "{}/projects/{}/datasets/{}/tables/{}/insertAll",
                 emulator_http, self.config.project_id, self.config.dataset, table_id
             );
-            let response = reqwest::Client::new()
-                .post(url)
-                .json(&request)
-                .send()
-                .await?;
+            let response = Self::await_with_timeout(
+                format!("posting emulator insertAll for {}", table_id),
+                BIGQUERY_REQUEST_TIMEOUT,
+                reqwest::Client::new().post(url).json(&request).send(),
+            )
+            .await?;
             if !response.status().is_success() {
                 error!(
                     table = %table_id,
@@ -470,7 +559,12 @@ impl BigQueryDestination {
                 );
                 anyhow::bail!("emulator insert failed: {}", response.status());
             }
-            let payload: serde_json::Value = response.json().await?;
+            let payload: serde_json::Value = Self::await_with_timeout(
+                format!("decoding emulator insertAll response for {}", table_id),
+                BIGQUERY_REQUEST_TIMEOUT,
+                response.json(),
+            )
+            .await?;
             if let Some(errors) = payload.get("insertErrors") {
                 let row_errors = errors.as_array().map(|rows| rows.len()).unwrap_or(1) as u64;
                 crate::telemetry::record_bigquery_row_errors(table_id, row_errors);
@@ -489,16 +583,17 @@ impl BigQueryDestination {
             return Ok(());
         }
 
-        let response = self
-            .client
-            .tabledata()
-            .insert(
+        let response = Self::await_with_timeout(
+            format!("running BigQuery insertAll for {}", table_id),
+            BIGQUERY_REQUEST_TIMEOUT,
+            self.client.tabledata().insert(
                 &self.config.project_id,
                 &self.config.dataset,
                 table_id,
                 &request,
-            )
-            .await?;
+            ),
+        )
+        .await?;
         if let Some(errors) = response.insert_errors {
             crate::telemetry::record_bigquery_row_errors(table_id, errors.len() as u64);
             error!(
@@ -572,22 +667,47 @@ impl BigQueryDestination {
                 "{}/projects/{}/datasets/{}/tables/{}",
                 emulator_http, self.config.project_id, self.config.dataset, table
             );
-            let response = client.delete(url).send().await?;
+            let response = Self::await_with_timeout(
+                format!("dropping emulator BigQuery table {}", table),
+                BIGQUERY_REQUEST_TIMEOUT,
+                client.delete(url).send(),
+            )
+            .await?;
             if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
                 return Ok(());
             }
             anyhow::bail!("emulator delete table failed: {}", response.status());
         }
-        match self
-            .client
-            .table()
-            .delete(&self.config.project_id, &self.config.dataset, table)
-            .await
+        match Self::await_bq_timeout(
+            format!("dropping BigQuery table {}", table),
+            BIGQUERY_REQUEST_TIMEOUT,
+            self.client
+                .table()
+                .delete(&self.config.project_id, &self.config.dataset, table),
+        )
+        .await
         {
             Ok(_) => Ok(()),
             Err(BqError::Response(err)) if err.code == 404 => Ok(()),
             Err(err) => Err(err.into()),
         }
+    }
+
+    fn spawn_drop_table_if_exists(&self, table: String) {
+        if self.dry_run {
+            return;
+        }
+
+        let dest = self.clone();
+        tokio::spawn(async move {
+            if let Err(err) = dest.drop_table_if_exists(&table).await {
+                warn!(
+                    table = %table,
+                    error = %err,
+                    "failed to drop BigQuery staging table after upsert"
+                );
+            }
+        });
     }
 }
 
@@ -609,7 +729,12 @@ impl Destination for BigQueryDestination {
                 "{}/projects/{}/datasets/{}/tables/{}",
                 emulator_http, self.config.project_id, self.config.dataset, table
             );
-            let response = client.delete(url).send().await?;
+            let response = Self::await_with_timeout(
+                format!("truncating emulator BigQuery table {}", table),
+                BIGQUERY_REQUEST_TIMEOUT,
+                client.delete(url).send(),
+            )
+            .await?;
             if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
                 return Ok(());
             }
@@ -661,13 +786,7 @@ impl Destination for BigQueryDestination {
                         self.merge_staging(table, &staging, schema, pk).await
                     }
                     .await;
-                    if let Err(err) = self.drop_table_if_exists(&staging).await {
-                        warn!(
-                            table = %staging,
-                            error = %err,
-                            "failed to drop BigQuery staging table after upsert"
-                        );
-                    }
+                    self.spawn_drop_table_if_exists(staging);
                     result?;
                 } else {
                     warn!("no primary key for {table}; falling back to append");
@@ -696,7 +815,10 @@ fn upsert_staging_table_id(table: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::upsert_staging_table_id;
+    use super::{BIGQUERY_REQUEST_TIMEOUT, BigQueryDestination, upsert_staging_table_id};
+    use gcloud_bigquery::http::error::Error as BqError;
+    use std::future::pending;
+    use std::time::Duration;
 
     #[test]
     fn upsert_staging_table_id_is_unique_per_write() {
@@ -706,5 +828,43 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with("public__accounts_staging_"));
         assert!(second.starts_with("public__accounts_staging_"));
+    }
+
+    #[tokio::test]
+    async fn generic_timeout_helper_times_out() {
+        let result = BigQueryDestination::await_with_timeout(
+            "pending future",
+            Duration::from_millis(10),
+            pending::<Result<(), anyhow::Error>>(),
+        )
+        .await;
+
+        let err = result.expect_err("expected timeout");
+        assert!(err.to_string().contains("pending future timed out"));
+    }
+
+    #[tokio::test]
+    async fn bq_timeout_helper_returns_bq_error() {
+        let result = BigQueryDestination::await_bq_timeout(
+            "pending bigquery future",
+            Duration::from_millis(10),
+            pending::<std::result::Result<(), BqError>>(),
+        )
+        .await;
+
+        match result.expect_err("expected timeout") {
+            BqError::HttpMiddleware(err) => {
+                assert!(
+                    err.to_string()
+                        .contains("pending bigquery future timed out")
+                )
+            }
+            other => panic!("expected HttpMiddleware timeout error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_timeout_is_longer_than_zero() {
+        assert!(BIGQUERY_REQUEST_TIMEOUT > Duration::ZERO);
     }
 }
