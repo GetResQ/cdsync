@@ -4,6 +4,7 @@ use crate::destinations::Destination;
 use async_trait::async_trait;
 use polars::prelude::{NamedFrom, Series};
 use std::collections::HashMap;
+use std::future::pending;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -141,6 +142,23 @@ fn cdc_fill_deadline_reached_tracks_pending_batch_age() {
         Duration::from_secs(5),
         &pending,
     ));
+}
+
+#[tokio::test]
+async fn cdc_timeout_helper_errors_on_elapsed_deadline() {
+    let result = super::cdc_pipeline::await_cdc_timeout(
+        "pending watermark operation",
+        Duration::from_millis(10),
+        pending::<Result<(), anyhow::Error>>(),
+    )
+    .await;
+
+    let err = result.expect_err("expected timeout");
+    assert!(
+        err.to_string()
+            .contains("pending watermark operation timed out"),
+        "{err}"
+    );
 }
 
 #[test]

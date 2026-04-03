@@ -7,6 +7,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use chrono::{DateTime, NaiveTime, TimeZone, Utc};
 use etl::destination::Destination as EtlDestination;
+use etl::destination::async_result::{
+    TruncateTableResult, WriteEventsResult, WriteTableRowsResult,
+};
 use etl::error::{ErrorKind, EtlError, EtlResult};
 use etl::types::{Cell, Event, TableId, TableRow};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -348,90 +351,121 @@ impl EtlDestination for EtlBigQueryDestination {
         "cdsync_bigquery"
     }
 
-    async fn truncate_table(&self, table_id: TableId) -> EtlResult<()> {
-        let info = self.get_table(table_id).await?;
-        self.inner
-            .truncate_table(&info.dest_name)
-            .await
-            .map_err(|err| {
-                etl::etl_error!(
-                    ErrorKind::DestinationError,
-                    "failed to truncate table",
-                    err.to_string()
-                )
-            })
+    async fn truncate_table(
+        &self,
+        table_id: TableId,
+        async_result: TruncateTableResult<()>,
+    ) -> EtlResult<()> {
+        let result = async {
+            let info = self.get_table(table_id).await?;
+            self.inner
+                .truncate_table(&info.dest_name)
+                .await
+                .map_err(|err| {
+                    etl::etl_error!(
+                        ErrorKind::DestinationError,
+                        "failed to truncate table",
+                        err.to_string()
+                    )
+                })
+        }
+        .await;
+
+        async_result.send(result);
+        Ok(())
     }
 
     async fn write_table_rows(
         &self,
         table_id: TableId,
         table_rows: Vec<TableRow>,
+        async_result: WriteTableRowsResult<()>,
     ) -> EtlResult<()> {
-        let info = self.get_table(table_id).await?;
-        let synced_at = Utc::now();
-        self.write_rows(&info, table_rows, WriteMode::Append, synced_at, None)
-            .await
+        let result = async {
+            let info = self.get_table(table_id).await?;
+            let synced_at = Utc::now();
+            self.write_rows(&info, table_rows, WriteMode::Append, synced_at, None)
+                .await
+        }
+        .await;
+
+        async_result.send(result);
+        Ok(())
     }
 
-    async fn write_events(&self, events: Vec<Event>) -> EtlResult<()> {
-        let mut pending: HashMap<TableId, Vec<TableRow>> = HashMap::new();
-        let mut pending_deletes: HashMap<TableId, Vec<TableRow>> = HashMap::new();
-        let mut truncate_tables: Vec<TableId> = Vec::new();
+    async fn write_events(
+        &self,
+        events: Vec<Event>,
+        async_result: WriteEventsResult<()>,
+    ) -> EtlResult<()> {
+        let result = async {
+            let mut pending: HashMap<TableId, Vec<TableRow>> = HashMap::new();
+            let mut pending_deletes: HashMap<TableId, Vec<TableRow>> = HashMap::new();
+            let mut truncate_tables: Vec<TableId> = Vec::new();
 
-        for event in events {
-            match event {
-                Event::Insert(insert_event) => {
-                    if let Ok(info) = self.get_table(insert_event.table_id).await {
-                        pending
-                            .entry(info.table_id)
-                            .or_default()
-                            .push(insert_event.table_row);
-                    }
-                }
-                Event::Update(update_event) => {
-                    if let Ok(info) = self.get_table(update_event.table_id).await {
-                        pending
-                            .entry(info.table_id)
-                            .or_default()
-                            .push(update_event.table_row);
-                    }
-                }
-                Event::Delete(delete_event) => {
-                    if let Ok(info) = self.get_table(delete_event.table_id).await {
-                        if !info.soft_delete {
-                            continue;
-                        }
-                        if let Some((_, old_row)) = &delete_event.old_table_row {
-                            pending_deletes
+            for event in events {
+                match event {
+                    Event::Insert(insert_event) => {
+                        if let Ok(info) = self.get_table(insert_event.table_id).await {
+                            pending
                                 .entry(info.table_id)
                                 .or_default()
-                                .push(old_row.clone());
-                        } else {
-                            warn!(
-                                table = %info.source_name,
-                                "skipping delete event without primary key"
-                            );
+                                .push(insert_event.table_row);
                         }
                     }
-                }
-                Event::Truncate(truncate_event) => {
-                    for rel_id in truncate_event.rel_ids {
-                        truncate_tables.push(TableId::new(rel_id));
+                    Event::Update(update_event) => {
+                        if let Ok(info) = self.get_table(update_event.table_id).await {
+                            pending
+                                .entry(info.table_id)
+                                .or_default()
+                                .push(update_event.table_row);
+                        }
                     }
-                }
-                Event::Commit(_) => {
-                    self.flush_pending(&mut pending, &mut pending_deletes, &mut truncate_tables)
+                    Event::Delete(delete_event) => {
+                        if let Ok(info) = self.get_table(delete_event.table_id).await {
+                            if !info.soft_delete {
+                                continue;
+                            }
+                            if let Some((_, old_row)) = delete_event.old_table_row {
+                                pending_deletes
+                                    .entry(info.table_id)
+                                    .or_default()
+                                    .push(old_row);
+                            } else {
+                                warn!(
+                                    table = %info.source_name,
+                                    "skipping delete event without primary key"
+                                );
+                            }
+                        }
+                    }
+                    Event::Truncate(truncate_event) => {
+                        for rel_id in truncate_event.rel_ids {
+                            truncate_tables.push(TableId::new(rel_id));
+                        }
+                    }
+                    Event::Commit(_) => {
+                        self.flush_pending(
+                            &mut pending,
+                            &mut pending_deletes,
+                            &mut truncate_tables,
+                        )
                         .await?;
+                    }
+                    Event::Begin(_) | Event::Relation(_) | Event::Unsupported => {}
                 }
-                Event::Begin(_) | Event::Relation(_) | Event::Unsupported => {}
             }
-        }
 
-        if !pending.is_empty() || !pending_deletes.is_empty() || !truncate_tables.is_empty() {
-            self.flush_pending(&mut pending, &mut pending_deletes, &mut truncate_tables)
-                .await?;
-        }
+            if !pending.is_empty() || !pending_deletes.is_empty() || !truncate_tables.is_empty() {
+                self.flush_pending(&mut pending, &mut pending_deletes, &mut truncate_tables)
+                    .await?;
+            }
 
+            Ok(())
+        }
+        .await;
+
+        async_result.send(result);
         Ok(())
     }
 }
@@ -544,7 +578,7 @@ fn compact_table_events(
 
 fn primary_key_identity(info: &CdcTableInfo, row: &TableRow) -> EtlResult<String> {
     let cell = row
-        .values
+        .values()
         .get(info.source_primary_key_index)
         .ok_or_else(|| {
             etl::etl_error!(
@@ -607,7 +641,7 @@ fn table_rows_to_frame(
             .iter()
             .zip(info.dest_source_indices.iter())
         {
-            let cell = row.values.get(*source_idx).unwrap_or(&Cell::Null);
+            let cell = row.values().get(*source_idx).unwrap_or(&Cell::Null);
             values.push(cell_to_anyvalue(cell, &column.data_type));
         }
 
@@ -644,7 +678,7 @@ fn table_rows_to_frame(
 
 fn derive_deleted_at_from_row(info: &CdcTableInfo, row: &TableRow) -> Option<String> {
     let idx = info.source_soft_delete_index?;
-    let cell = row.values.get(idx)?;
+    let cell = row.values().get(idx)?;
     match cell {
         Cell::Null => None,
         Cell::Bool(value) => {
@@ -1031,12 +1065,14 @@ mod tests {
             Event::Insert(InsertEvent {
                 start_lsn: etl::types::PgLsn::from(0),
                 commit_lsn: etl::types::PgLsn::from(1),
+                tx_ordinal: 0,
                 table_id,
                 table_row: TableRow::new(vec![Cell::I64(1), Cell::Null]),
             }),
             Event::Update(UpdateEvent {
                 start_lsn: etl::types::PgLsn::from(2),
                 commit_lsn: etl::types::PgLsn::from(3),
+                tx_ordinal: 1,
                 table_id,
                 table_row: TableRow::new(vec![Cell::I64(1), Cell::Bool(true)]),
                 old_table_row: None,
@@ -1061,12 +1097,14 @@ mod tests {
             Event::Delete(DeleteEvent {
                 start_lsn: etl::types::PgLsn::from(0),
                 commit_lsn: etl::types::PgLsn::from(1),
+                tx_ordinal: 0,
                 table_id,
                 old_table_row: Some((false, TableRow::new(vec![Cell::I64(1), Cell::Null]))),
             }),
             Event::Update(UpdateEvent {
                 start_lsn: etl::types::PgLsn::from(2),
                 commit_lsn: etl::types::PgLsn::from(3),
+                tx_ordinal: 1,
                 table_id,
                 table_row: TableRow::new(vec![Cell::I64(1), Cell::Null]),
                 old_table_row: None,
@@ -1086,18 +1124,21 @@ mod tests {
             Event::Insert(InsertEvent {
                 start_lsn: etl::types::PgLsn::from(0),
                 commit_lsn: etl::types::PgLsn::from(1),
+                tx_ordinal: 0,
                 table_id,
                 table_row: TableRow::new(vec![Cell::I64(1), Cell::Null]),
             }),
             Event::Truncate(TruncateEvent {
                 start_lsn: etl::types::PgLsn::from(2),
                 commit_lsn: etl::types::PgLsn::from(3),
+                tx_ordinal: 1,
                 options: 0,
                 rel_ids: vec![table_id.into_inner()],
             }),
             Event::Insert(InsertEvent {
                 start_lsn: etl::types::PgLsn::from(4),
                 commit_lsn: etl::types::PgLsn::from(5),
+                tx_ordinal: 2,
                 table_id,
                 table_row: TableRow::new(vec![Cell::I64(2), Cell::Null]),
             }),

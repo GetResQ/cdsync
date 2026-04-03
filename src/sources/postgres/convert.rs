@@ -528,7 +528,7 @@ pub(super) fn tuple_to_row(
         let value = match tuple_data.get(idx) {
             Some(TupleData::Null) => Cell::Null,
             Some(TupleData::UnchangedToast) => old_row
-                .and_then(|row| row.values.get(idx).cloned())
+                .and_then(|row| row.values().get(idx).map(copy_cell))
                 .unwrap_or(Cell::Null),
             Some(TupleData::Text(bytes)) => {
                 let text = String::from_utf8_lossy(bytes);
@@ -541,6 +541,54 @@ pub(super) fn tuple_to_row(
     }
 
     Ok(TableRow::new(values))
+}
+
+fn copy_cell(cell: &Cell) -> Cell {
+    match cell {
+        Cell::Null => Cell::Null,
+        Cell::Bool(value) => Cell::Bool(*value),
+        Cell::String(value) => Cell::String(value.clone()),
+        Cell::I16(value) => Cell::I16(*value),
+        Cell::I32(value) => Cell::I32(*value),
+        Cell::U32(value) => Cell::U32(*value),
+        Cell::I64(value) => Cell::I64(*value),
+        Cell::F32(value) => Cell::F32(*value),
+        Cell::F64(value) => Cell::F64(*value),
+        Cell::Numeric(value) => Cell::Numeric(value.clone()),
+        Cell::Date(value) => Cell::Date(*value),
+        Cell::Time(value) => Cell::Time(*value),
+        Cell::Timestamp(value) => Cell::Timestamp(*value),
+        Cell::TimestampTz(value) => Cell::TimestampTz(*value),
+        Cell::Uuid(value) => Cell::Uuid(*value),
+        Cell::Json(value) => Cell::Json(value.clone()),
+        Cell::Bytes(value) => Cell::Bytes(value.clone()),
+        Cell::Array(value) => Cell::Array(copy_array_cell(value)),
+    }
+}
+
+fn copy_array_cell(cell: &etl::types::ArrayCell) -> etl::types::ArrayCell {
+    match cell {
+        etl::types::ArrayCell::Bool(values) => etl::types::ArrayCell::Bool(values.clone()),
+        etl::types::ArrayCell::String(values) => etl::types::ArrayCell::String(values.clone()),
+        etl::types::ArrayCell::I16(values) => etl::types::ArrayCell::I16(values.clone()),
+        etl::types::ArrayCell::I32(values) => etl::types::ArrayCell::I32(values.clone()),
+        etl::types::ArrayCell::U32(values) => etl::types::ArrayCell::U32(values.clone()),
+        etl::types::ArrayCell::I64(values) => etl::types::ArrayCell::I64(values.clone()),
+        etl::types::ArrayCell::F32(values) => etl::types::ArrayCell::F32(values.clone()),
+        etl::types::ArrayCell::F64(values) => etl::types::ArrayCell::F64(values.clone()),
+        etl::types::ArrayCell::Numeric(values) => etl::types::ArrayCell::Numeric(values.clone()),
+        etl::types::ArrayCell::Date(values) => etl::types::ArrayCell::Date(values.clone()),
+        etl::types::ArrayCell::Time(values) => etl::types::ArrayCell::Time(values.clone()),
+        etl::types::ArrayCell::Timestamp(values) => {
+            etl::types::ArrayCell::Timestamp(values.clone())
+        }
+        etl::types::ArrayCell::TimestampTz(values) => {
+            etl::types::ArrayCell::TimestampTz(values.clone())
+        }
+        etl::types::ArrayCell::Uuid(values) => etl::types::ArrayCell::Uuid(values.clone()),
+        etl::types::ArrayCell::Json(values) => etl::types::ArrayCell::Json(values.clone()),
+        etl::types::ArrayCell::Bytes(values) => etl::types::ArrayCell::Bytes(values.clone()),
+    }
 }
 
 pub(super) fn parse_text_cell(typ: &etl::types::Type, text: &str) -> Cell {

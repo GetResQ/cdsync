@@ -112,6 +112,7 @@ impl PostgresSource {
         let mut last_flushed_lsn = start_lsn;
         let mut last_xlog_activity = Instant::now();
         let mut tx_extract_started_at: Option<Instant> = None;
+        let mut next_tx_ordinal = 0u64;
         let mut in_tx = false;
         let mut expected_commit_lsn: Option<etl::types::PgLsn> = None;
         let mut shutdown = shutdown;
@@ -122,6 +123,7 @@ impl PostgresSource {
         let mut inflight_apply: FuturesUnordered<CdcApplyFuture> = FuturesUnordered::new();
         let mut watermark_tracker = CdcWatermarkTracker::default();
         let mut table_apply_locks: HashMap<TableId, Arc<Mutex<()>>> = HashMap::new();
+        let mut active_table_applies: HashSet<TableId> = HashSet::new();
         let max_active_applies = apply_concurrency.max(1);
         let max_commit_queue_depth = max_active_applies.saturating_mul(4).max(1);
 
@@ -150,7 +152,11 @@ impl PostgresSource {
                         continue;
                     }
                     result = inflight_apply.next(), if !inflight_apply.is_empty() => {
-                        for advance in handle_cdc_apply_result(result, &mut watermark_tracker)? {
+                        for advance in handle_cdc_apply_result(
+                            result,
+                            &mut watermark_tracker,
+                            &mut active_table_applies,
+                        )? {
                             apply_cdc_watermark_advance(
                                 advance,
                                 &mut CdcWatermarkRuntime {
@@ -171,7 +177,10 @@ impl PostgresSource {
                             &mut inflight_apply,
                             &mut watermark_tracker,
                             dest,
-                            &mut table_apply_locks,
+                            &mut CdcApplyCoordination {
+                                table_apply_locks: &mut table_apply_locks,
+                                active_table_applies: &mut active_table_applies,
+                            },
                             CdcDispatchConfig {
                                 max_active_applies,
                                 apply_batch_size,
@@ -200,7 +209,10 @@ impl PostgresSource {
                                         &mut inflight_apply,
                                         &mut watermark_tracker,
                                         dest,
-                                        &mut table_apply_locks,
+                                        &mut CdcApplyCoordination {
+                                            table_apply_locks: &mut table_apply_locks,
+                                            active_table_applies: &mut active_table_applies,
+                                        },
                                         CdcDispatchConfig {
                                             max_active_applies,
                                             apply_batch_size,
@@ -231,7 +243,11 @@ impl PostgresSource {
             } else {
                 tokio::select! {
                     result = inflight_apply.next(), if !inflight_apply.is_empty() => {
-                        for advance in handle_cdc_apply_result(result, &mut watermark_tracker)? {
+                        for advance in handle_cdc_apply_result(
+                            result,
+                            &mut watermark_tracker,
+                            &mut active_table_applies,
+                        )? {
                             apply_cdc_watermark_advance(
                                 advance,
                                 &mut CdcWatermarkRuntime {
@@ -252,7 +268,10 @@ impl PostgresSource {
                             &mut inflight_apply,
                             &mut watermark_tracker,
                             dest,
-                            &mut table_apply_locks,
+                            &mut CdcApplyCoordination {
+                                table_apply_locks: &mut table_apply_locks,
+                                active_table_applies: &mut active_table_applies,
+                            },
                             CdcDispatchConfig {
                                 max_active_applies,
                                 apply_batch_size,
@@ -280,7 +299,10 @@ impl PostgresSource {
                                 &mut inflight_apply,
                                 &mut watermark_tracker,
                                 dest,
-                                &mut table_apply_locks,
+                                &mut CdcApplyCoordination {
+                                    table_apply_locks: &mut table_apply_locks,
+                                    active_table_applies: &mut active_table_applies,
+                                },
                                 CdcDispatchConfig {
                                     max_active_applies,
                                     apply_batch_size,
@@ -338,6 +360,7 @@ impl PostgresSource {
                         LogicalReplicationMessage::Begin(begin) => {
                             in_tx = true;
                             tx_extract_started_at = Some(Instant::now());
+                            next_tx_ordinal = 0;
                             expected_commit_lsn = Some(etl::types::PgLsn::from(begin.final_lsn()));
                             pending_events.clear();
                             pending_stats.clear();
@@ -376,7 +399,10 @@ impl PostgresSource {
                                 &mut inflight_apply,
                                 &mut watermark_tracker,
                                 dest,
-                                &mut table_apply_locks,
+                                &mut CdcApplyCoordination {
+                                    table_apply_locks: &mut table_apply_locks,
+                                    active_table_applies: &mut active_table_applies,
+                                },
                                 CdcDispatchConfig {
                                     max_active_applies,
                                     apply_batch_size,
@@ -405,7 +431,10 @@ impl PostgresSource {
                                     &mut inflight_apply,
                                     &mut watermark_tracker,
                                     dest,
-                                    &mut table_apply_locks,
+                                    &mut CdcApplyCoordination {
+                                        table_apply_locks: &mut table_apply_locks,
+                                        active_table_applies: &mut active_table_applies,
+                                    },
                                     CdcDispatchConfig {
                                         max_active_applies,
                                         apply_batch_size,
@@ -413,9 +442,12 @@ impl PostgresSource {
                                         force_flush: true,
                                     },
                                 );
-                                for advance in
-                                    drain_one_cdc_apply(&mut inflight_apply, &mut watermark_tracker)
-                                        .await?
+                                for advance in drain_one_cdc_apply(
+                                    &mut inflight_apply,
+                                    &mut watermark_tracker,
+                                    &mut active_table_applies,
+                                )
+                                .await?
                                 {
                                     apply_cdc_watermark_advance(
                                         advance,
@@ -445,7 +477,10 @@ impl PostgresSource {
                                 &mut inflight_apply,
                                 &mut watermark_tracker,
                                 dest,
-                                &mut table_apply_locks,
+                                &mut CdcApplyCoordination {
+                                    table_apply_locks: &mut table_apply_locks,
+                                    active_table_applies: &mut active_table_applies,
+                                },
                                 CdcDispatchConfig {
                                     max_active_applies,
                                     apply_batch_size,
@@ -517,6 +552,8 @@ impl PostgresSource {
                             }
                             *pending_stats.entry(table_id).or_insert(0) += 1;
                             let commit_lsn = expected_commit_lsn.unwrap_or(start);
+                            let tx_ordinal = next_tx_ordinal;
+                            next_tx_ordinal = next_tx_ordinal.saturating_add(1);
                             let schema = store
                                 .get_table_schema(&table_id)
                                 .await?
@@ -529,6 +566,7 @@ impl PostgresSource {
                             let event = InsertEvent {
                                 start_lsn: start,
                                 commit_lsn,
+                                tx_ordinal,
                                 table_id,
                                 table_row,
                             };
@@ -547,6 +585,8 @@ impl PostgresSource {
                             }
                             *pending_stats.entry(table_id).or_insert(0) += 1;
                             let commit_lsn = expected_commit_lsn.unwrap_or(start);
+                            let tx_ordinal = next_tx_ordinal;
+                            next_tx_ordinal = next_tx_ordinal.saturating_add(1);
                             let schema = store
                                 .get_table_schema(&table_id)
                                 .await?
@@ -571,6 +611,7 @@ impl PostgresSource {
                             let event = UpdateEvent {
                                 start_lsn: start,
                                 commit_lsn,
+                                tx_ordinal,
                                 table_id,
                                 table_row,
                                 old_table_row,
@@ -590,6 +631,8 @@ impl PostgresSource {
                             }
                             *pending_stats.entry(table_id).or_insert(0) += 1;
                             let commit_lsn = expected_commit_lsn.unwrap_or(start);
+                            let tx_ordinal = next_tx_ordinal;
+                            next_tx_ordinal = next_tx_ordinal.saturating_add(1);
                             let schema = store
                                 .get_table_schema(&table_id)
                                 .await?
@@ -609,6 +652,7 @@ impl PostgresSource {
                             let event = DeleteEvent {
                                 start_lsn: start,
                                 commit_lsn,
+                                tx_ordinal,
                                 table_id,
                                 old_table_row,
                             };
@@ -623,9 +667,12 @@ impl PostgresSource {
                                 continue;
                             }
                             let commit_lsn = expected_commit_lsn.unwrap_or(start);
+                            let tx_ordinal = next_tx_ordinal;
+                            next_tx_ordinal = next_tx_ordinal.saturating_add(1);
                             let event = TruncateEvent {
                                 start_lsn: start,
                                 commit_lsn,
+                                tx_ordinal,
                                 options: truncate.options(),
                                 rel_ids,
                             };
@@ -640,7 +687,11 @@ impl PostgresSource {
             }
 
             while let Some(Some(result)) = inflight_apply.next().now_or_never() {
-                for advance in handle_cdc_apply_result(Some(result), &mut watermark_tracker)? {
+                for advance in handle_cdc_apply_result(
+                    Some(result),
+                    &mut watermark_tracker,
+                    &mut active_table_applies,
+                )? {
                     apply_cdc_watermark_advance(
                         advance,
                         &mut CdcWatermarkRuntime {
@@ -663,7 +714,10 @@ impl PostgresSource {
                 &mut inflight_apply,
                 &mut watermark_tracker,
                 dest,
-                &mut table_apply_locks,
+                &mut CdcApplyCoordination {
+                    table_apply_locks: &mut table_apply_locks,
+                    active_table_applies: &mut active_table_applies,
+                },
                 CdcDispatchConfig {
                     max_active_applies,
                     apply_batch_size,
@@ -700,7 +754,10 @@ impl PostgresSource {
             &mut inflight_apply,
             &mut watermark_tracker,
             dest,
-            &mut table_apply_locks,
+            &mut CdcApplyCoordination {
+                table_apply_locks: &mut table_apply_locks,
+                active_table_applies: &mut active_table_applies,
+            },
             CdcDispatchConfig {
                 max_active_applies,
                 apply_batch_size,
@@ -715,7 +772,13 @@ impl PostgresSource {
             watermark_tracker.inflight_commits() as u64,
         );
         while !inflight_apply.is_empty() || !pending_table_batches.is_empty() {
-            for advance in drain_one_cdc_apply(&mut inflight_apply, &mut watermark_tracker).await? {
+            for advance in drain_one_cdc_apply(
+                &mut inflight_apply,
+                &mut watermark_tracker,
+                &mut active_table_applies,
+            )
+            .await?
+            {
                 apply_cdc_watermark_advance(
                     advance,
                     &mut CdcWatermarkRuntime {
@@ -736,7 +799,10 @@ impl PostgresSource {
                 &mut inflight_apply,
                 &mut watermark_tracker,
                 dest,
-                &mut table_apply_locks,
+                &mut CdcApplyCoordination {
+                    table_apply_locks: &mut table_apply_locks,
+                    active_table_applies: &mut active_table_applies,
+                },
                 CdcDispatchConfig {
                     max_active_applies,
                     apply_batch_size,

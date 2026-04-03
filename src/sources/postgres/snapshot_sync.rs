@@ -557,7 +557,7 @@ impl PostgresSource {
             username: username.to_string(),
             password,
             tls,
-            keepalive: None,
+            keepalive: Default::default(),
         })
     }
 

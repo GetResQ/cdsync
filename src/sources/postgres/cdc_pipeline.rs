@@ -1,5 +1,8 @@
 use super::*;
 
+const CDC_STATUS_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
+const CDC_STATE_SAVE_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub(super) struct CommittedCdcBatch {
     pub(super) sequence: u64,
     pub(super) commit_lsn: etl::types::PgLsn,
@@ -15,6 +18,7 @@ pub(super) struct CdcTableApplyBatch {
 
 pub(super) struct CdcApplyFragmentAck {
     pub(super) sequences: Vec<u64>,
+    pub(super) released_table: Option<TableId>,
 }
 
 pub(super) struct CommitTrackerEntry {
@@ -55,6 +59,11 @@ pub(super) struct CdcDispatchConfig {
     pub(super) apply_batch_size: usize,
     pub(super) max_fill: Duration,
     pub(super) force_flush: bool,
+}
+
+pub(super) struct CdcApplyCoordination<'a> {
+    pub(super) table_apply_locks: &'a mut HashMap<TableId, Arc<Mutex<()>>>,
+    pub(super) active_table_applies: &'a mut HashSet<TableId>,
 }
 
 impl CdcWatermarkTracker {
@@ -147,6 +156,7 @@ pub(super) fn split_commit_events_by_table(events: Vec<Event>) -> Vec<CdcTableAp
                         Event::Truncate(TruncateEvent {
                             start_lsn: truncate.start_lsn,
                             commit_lsn: truncate.commit_lsn,
+                            tx_ordinal: truncate.tx_ordinal,
                             options: truncate.options,
                             rel_ids: vec![rel_id],
                         }),
@@ -173,7 +183,7 @@ pub(super) fn dispatch_cdc_batches(
     inflight_apply: &mut FuturesUnordered<CdcApplyFuture>,
     watermark_tracker: &mut CdcWatermarkTracker,
     dest: &EtlBigQueryDestination,
-    table_apply_locks: &mut HashMap<TableId, Arc<Mutex<()>>>,
+    coordination: &mut CdcApplyCoordination<'_>,
     config: CdcDispatchConfig,
 ) {
     while let Some(batch) = queued_batches.pop_front() {
@@ -188,9 +198,12 @@ pub(super) fn dispatch_cdc_batches(
 
         if batch.table_batches.is_empty() {
             let sequences = vec![batch.sequence];
-            inflight_apply.push(Box::pin(
-                async move { Ok(CdcApplyFragmentAck { sequences }) },
-            ));
+            inflight_apply.push(Box::pin(async move {
+                Ok(CdcApplyFragmentAck {
+                    sequences,
+                    released_table: None,
+                })
+            }));
             continue;
         }
 
@@ -229,16 +242,21 @@ pub(super) fn dispatch_cdc_batches(
         if inflight_apply.len() >= config.max_active_applies {
             break;
         }
+        if coordination.active_table_applies.contains(&table_id) {
+            continue;
+        }
         let pending = pending_table_batches
             .remove(&table_id)
             .expect("pending batch missing for ready table");
-        let table_lock = table_apply_locks
+        let table_lock = coordination
+            .table_apply_locks
             .entry(table_id)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
         let apply_dest = dest.clone();
         let sequences = pending.sequences;
         let events = pending.events;
+        coordination.active_table_applies.insert(table_id);
         inflight_apply.push(Box::pin(async move {
             let _guard = table_lock.lock().await;
             apply_dest
@@ -251,7 +269,10 @@ pub(super) fn dispatch_cdc_batches(
                         err
                     )
                 })?;
-            Ok(CdcApplyFragmentAck { sequences })
+            Ok(CdcApplyFragmentAck {
+                sequences,
+                released_table: Some(table_id),
+            })
         }));
     }
 }
@@ -259,11 +280,15 @@ pub(super) fn dispatch_cdc_batches(
 pub(super) fn handle_cdc_apply_result(
     result: Option<Result<CdcApplyFragmentAck>>,
     watermark_tracker: &mut CdcWatermarkTracker,
+    active_table_applies: &mut HashSet<TableId>,
 ) -> Result<Vec<CdcWatermarkAdvance>> {
     let Some(result) = result else {
         return Ok(Vec::new());
     };
     let ack = result?;
+    if let Some(table_id) = ack.released_table {
+        active_table_applies.remove(&table_id);
+    }
     let mut advances = Vec::new();
     for sequence in ack.sequences {
         if let Some(advance) = watermark_tracker.complete_fragment(sequence)? {
@@ -276,9 +301,10 @@ pub(super) fn handle_cdc_apply_result(
 pub(super) async fn drain_one_cdc_apply(
     inflight_apply: &mut FuturesUnordered<CdcApplyFuture>,
     watermark_tracker: &mut CdcWatermarkTracker,
+    active_table_applies: &mut HashSet<TableId>,
 ) -> Result<Vec<CdcWatermarkAdvance>> {
     let result = inflight_apply.next().await;
-    handle_cdc_apply_result(result, watermark_tracker)
+    handle_cdc_apply_result(result, watermark_tracker, active_table_applies)
 }
 
 pub(super) fn pending_cdc_commit_count(
@@ -315,21 +341,61 @@ pub(super) async fn apply_cdc_watermark_advance(
     }
 
     *last_flushed_lsn = advance.commit_lsn;
-    stream
-        .send_status_update(
+    await_cdc_timeout(
+        format!("sending CDC status update for {}", advance.commit_lsn),
+        CDC_STATUS_UPDATE_TIMEOUT,
+        stream.send_status_update(
             last_received_lsn,
             *last_flushed_lsn,
             true,
             StatusUpdateType::KeepAlive,
-        )
-        .await?;
+        ),
+    )
+    .await?;
     let cdc_state = runtime
         .state
         .postgres_cdc
         .get_or_insert_with(Default::default);
     cdc_state.last_lsn = Some(last_flushed_lsn.to_string());
     if let Some(state_handle) = runtime.state_handle {
-        state_handle.save_postgres_cdc_state(cdc_state).await?;
+        match timeout(
+            CDC_STATE_SAVE_TIMEOUT,
+            state_handle.save_postgres_cdc_state(cdc_state),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                warn!(
+                    lsn = %advance.commit_lsn,
+                    error = %err,
+                    "failed to persist postgres CDC state after advancing watermark"
+                );
+            }
+            Err(_) => {
+                warn!(
+                    lsn = %advance.commit_lsn,
+                    timeout_secs = CDC_STATE_SAVE_TIMEOUT.as_secs(),
+                    "persisting postgres CDC state timed out after advancing watermark"
+                );
+            }
+        }
     }
     Ok(())
+}
+
+pub(super) async fn await_cdc_timeout<T, E, F>(
+    label: impl Into<String>,
+    duration: Duration,
+    fut: F,
+) -> Result<T>
+where
+    F: Future<Output = std::result::Result<T, E>>,
+    E: Into<anyhow::Error>,
+{
+    let label = label.into();
+    match timeout(duration, fut).await {
+        Ok(result) => result.map_err(Into::into).with_context(|| label.clone()),
+        Err(_) => anyhow::bail!("{} timed out after {}s", label, duration.as_secs()),
+    }
 }
