@@ -917,12 +917,8 @@ async fn run_connection_worker(
     match (&connection.source, &connection.destination) {
         (SourceConfig::Postgres(pg), DestinationConfig::BigQuery(_)) if pg.cdc.unwrap_or(true) => {
             let cfg = Config::load(&config_path).await?;
-            let checkpoint_age_task = spawn_checkpoint_age_reporter(
-                &cfg,
-                &connection,
-                shutdown_signal.clone(),
-            )
-            .await?;
+            let checkpoint_age_task =
+                spawn_checkpoint_age_reporter(&cfg, &connection, shutdown_signal.clone()).await?;
             let result = cmd_sync(SyncCommandRequest {
                 config_path,
                 full: false,
@@ -941,7 +937,11 @@ async fn run_connection_worker(
             telemetry::record_connection_worker_event(
                 &connection.id,
                 mode,
-                if result.is_ok() { "succeeded" } else { "failed" },
+                if result.is_ok() {
+                    "succeeded"
+                } else {
+                    "failed"
+                },
             );
             result
         }

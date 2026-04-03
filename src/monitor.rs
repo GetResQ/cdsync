@@ -212,7 +212,12 @@ pub async fn cmd_monitor(args: MonitorArgs) -> Result<()> {
         return Ok(());
     }
 
-    run_tui(client, args.connection, Duration::from_secs(args.refresh_seconds.max(1))).await
+    run_tui(
+        client,
+        args.connection,
+        Duration::from_secs(args.refresh_seconds.max(1)),
+    )
+    .await
 }
 
 impl MonitorApiClient {
@@ -236,15 +241,20 @@ impl MonitorApiClient {
         })
     }
 
-    async fn fetch_snapshot(&self, selected_connection_id: Option<&str>) -> Result<MonitorSnapshot> {
+    async fn fetch_snapshot(
+        &self,
+        selected_connection_id: Option<&str>,
+    ) -> Result<MonitorSnapshot> {
         let status: StatusResponse = self.get_json("/v1/status").await?;
         let connections: Vec<ConnectionSummary> = self.get_json("/v1/connections").await?;
         let selected_connection_id =
             resolve_selected_connection_id(&connections, selected_connection_id)?;
         let progress = if let Some(connection_id) = &selected_connection_id {
             Some(
-                self.get_json::<ProgressResponse>(&format!("/v1/connections/{connection_id}/progress"))
-                    .await?,
+                self.get_json::<ProgressResponse>(&format!(
+                    "/v1/connections/{connection_id}/progress"
+                ))
+                .await?,
             )
         } else {
             None
@@ -273,7 +283,10 @@ impl MonitorApiClient {
             anyhow::bail!("admin API returned 401 for {}; check bearer token", path);
         }
         if response.status() == StatusCode::FORBIDDEN {
-            anyhow::bail!("admin API returned 403 for {}; token lacks required scope", path);
+            anyhow::bail!(
+                "admin API returned 403 for {}; token lacks required scope",
+                path
+            );
         }
 
         let response = response
@@ -371,8 +384,14 @@ async fn run_tui(
 ) -> Result<()> {
     let mut terminal = TerminalSession::new()?;
     let mut view_state = MonitorViewState { selected_index: 0 };
-    let mut snapshot = client.fetch_snapshot(requested_connection_id.as_deref()).await?;
-    reconcile_selection(&mut view_state, &snapshot, requested_connection_id.as_deref());
+    let mut snapshot = client
+        .fetch_snapshot(requested_connection_id.as_deref())
+        .await?;
+    reconcile_selection(
+        &mut view_state,
+        &snapshot,
+        requested_connection_id.as_deref(),
+    );
     let mut last_error: Option<String> = None;
     let mut next_refresh = tokio::time::Instant::now() + refresh_interval;
 
@@ -471,7 +490,10 @@ fn reconcile_selection(
         return;
     }
     if let Some(requested) = requested_connection_id
-        && let Some(index) = snapshot.connections.iter().position(|connection| connection.id == requested)
+        && let Some(index) = snapshot
+            .connections
+            .iter()
+            .position(|connection| connection.id == requested)
     {
         view_state.selected_index = index;
         return;
@@ -494,9 +516,11 @@ fn resolve_selected_connection_id(
     connections: &[ConnectionSummary],
     requested_connection_id: Option<&str>,
 ) -> Result<Option<String>> {
-    if let Some(requested) = requested_connection_id
-    {
-        if connections.iter().any(|connection| connection.id == requested) {
+    if let Some(requested) = requested_connection_id {
+        if connections
+            .iter()
+            .any(|connection| connection.id == requested)
+        {
             return Ok(Some(requested.to_string()));
         }
         anyhow::bail!("connection not found: {}", requested);
@@ -551,7 +575,12 @@ fn render_header(
 ) {
     let header = vec![
         Line::from(vec![
-            Span::styled(" CDSync Monitor ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " CDSync Monitor ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(format!(
                 " url: {}  refresh: {}s",
                 base_url,
@@ -587,7 +616,12 @@ fn render_header(
     frame.render_widget(paragraph, area);
 }
 
-fn render_body(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot, view_state: &MonitorViewState) {
+fn render_body(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &MonitorSnapshot,
+    view_state: &MonitorViewState,
+) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
@@ -609,7 +643,10 @@ fn render_connections(
         .enumerate()
         .map(|(index, connection)| {
             let style = if index == view_state.selected_index {
-                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -617,7 +654,12 @@ fn render_connections(
                 Cell::from(connection.id.clone()),
                 Cell::from(connection.phase.clone()),
                 Cell::from(format_age(connection.max_checkpoint_age_seconds)),
-                Cell::from(connection.last_sync_status.clone().unwrap_or_else(|| "-".to_string())),
+                Cell::from(
+                    connection
+                        .last_sync_status
+                        .clone()
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
             ])
             .style(style)
         })
@@ -633,8 +675,11 @@ fn render_connections(
         ],
     )
     .header(
-        Row::new(vec!["Connection", "Phase", "Age", "Status"])
-            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Row::new(vec!["Connection", "Phase", "Age", "Status"]).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
     )
     .block(
         Block::default()
@@ -672,11 +717,7 @@ fn render_runtime(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot)
             )),
             Line::from(format!(
                 " last status: {}   started: {}   finished: {}",
-                progress
-                    .runtime
-                    .last_sync_status
-                    .as_deref()
-                    .unwrap_or("-"),
+                progress.runtime.last_sync_status.as_deref().unwrap_or("-"),
                 progress
                     .runtime
                     .last_sync_started_at
@@ -716,7 +757,11 @@ fn render_runtime(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot)
 }
 
 fn render_run(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot) {
-    let lines = if let Some(run) = snapshot.progress.as_ref().and_then(|progress| progress.current_run.as_ref()) {
+    let lines = if let Some(run) = snapshot
+        .progress
+        .as_ref()
+        .and_then(|progress| progress.current_run.as_ref())
+    {
         vec![
             Line::from(format!(" run: {}", run.run_id)),
             Line::from(format!(
@@ -770,7 +815,10 @@ fn render_tables(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot) 
                         Cell::from(table.phase.clone()),
                         Cell::from(format_age(table.lag_seconds)),
                         Cell::from(if table.snapshot_chunks_total > 0 {
-                            format!("{}/{}", table.snapshot_chunks_complete, table.snapshot_chunks_total)
+                            format!(
+                                "{}/{}",
+                                table.snapshot_chunks_complete, table.snapshot_chunks_total
+                            )
                         } else {
                             "-".to_string()
                         }),
@@ -798,8 +846,11 @@ fn render_tables(frame: &mut Frame<'_>, area: Rect, snapshot: &MonitorSnapshot) 
         ],
     )
     .header(
-        Row::new(vec!["Table", "Phase", "Lag", "Chunks", "Last PK"])
-            .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Row::new(vec!["Table", "Phase", "Lag", "Chunks", "Last PK"]).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
     )
     .block(
         Block::default()
@@ -818,9 +869,11 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, last_error: Option<&str>) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let paragraph = Paragraph::new(message)
-        .style(style)
-        .block(Block::default().borders(Borders::ALL).border_set(border::ROUNDED));
+    let paragraph = Paragraph::new(message).style(style).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(border::ROUNDED),
+    );
     frame.render_widget(paragraph, area);
 }
 
@@ -846,7 +899,11 @@ fn render_plain(snapshot: &MonitorSnapshot) -> String {
         lines.push(format!(
             "{:<24} {:<8} {:<10} {:<10} {:<14} {:<18} age={:<8} status={} last_error={}",
             connection.id,
-            if connection.enabled { "enabled" } else { "disabled" },
+            if connection.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
             connection.source_kind,
             connection.destination_kind,
             connection.phase,
@@ -907,7 +964,10 @@ fn render_plain(snapshot: &MonitorSnapshot) -> String {
                 format_age(table.checkpoint_age_seconds),
                 format_age(table.lag_seconds),
                 if table.snapshot_chunks_total > 0 {
-                    format!("{}/{}", table.snapshot_chunks_complete, table.snapshot_chunks_total)
+                    format!(
+                        "{}/{}",
+                        table.snapshot_chunks_complete, table.snapshot_chunks_total
+                    )
                 } else {
                     "-".to_string()
                 },
@@ -921,7 +981,10 @@ fn render_plain(snapshot: &MonitorSnapshot) -> String {
                     .as_ref()
                     .map(|stats| format!(
                         "read={} written={} upserted={} deleted={}",
-                        stats.rows_read, stats.rows_written, stats.rows_upserted, stats.rows_deleted
+                        stats.rows_read,
+                        stats.rows_written,
+                        stats.rows_upserted,
+                        stats.rows_deleted
                     ))
                     .unwrap_or_else(|| "-".to_string()),
             ));
