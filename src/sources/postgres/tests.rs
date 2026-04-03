@@ -91,8 +91,33 @@ fn next_cdc_wait_timeout_uses_pending_fill_deadline_when_sooner() {
         Duration::from_secs(10),
         Duration::from_secs(2),
         &pending,
+        0,
+        1,
     );
     assert!(timeout <= Duration::from_millis(550));
+}
+
+#[test]
+fn next_cdc_wait_timeout_falls_back_to_idle_when_apply_slots_are_full() {
+    let mut pending = HashMap::new();
+    pending.insert(
+        TableId::new(1),
+        super::cdc_pipeline::PendingTableApplyBatch {
+            sequences: vec![1],
+            events: Vec::new(),
+            event_count: 1,
+            first_buffered_at: Instant::now() - Duration::from_secs(3),
+        },
+    );
+
+    let timeout = super::cdc_runtime::next_cdc_wait_timeout(
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+        &pending,
+        1,
+        1,
+    );
+    assert_eq!(timeout, Duration::from_secs(10));
 }
 
 #[test]

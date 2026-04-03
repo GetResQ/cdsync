@@ -119,8 +119,13 @@ impl PostgresSource {
                 break;
             }
 
-            let wait_timeout =
-                next_cdc_wait_timeout(idle_timeout, apply_max_fill, &pending_table_batches);
+            let wait_timeout = next_cdc_wait_timeout(
+                idle_timeout,
+                apply_max_fill,
+                &pending_table_batches,
+                inflight_apply.len(),
+                max_active_applies,
+            );
             let message = if let Some(shutdown) = shutdown.as_mut() {
                 tokio::select! {
                     changed = shutdown.changed(), if !shutdown_requested => {
@@ -855,7 +860,13 @@ pub(super) fn next_cdc_wait_timeout(
     idle_timeout: Duration,
     apply_max_fill: Duration,
     pending_table_batches: &HashMap<TableId, PendingTableApplyBatch>,
+    inflight_apply_count: usize,
+    max_active_applies: usize,
 ) -> Duration {
+    if inflight_apply_count >= max_active_applies.max(1) {
+        return idle_timeout;
+    }
+
     let now = Instant::now();
     pending_table_batches
         .values()
