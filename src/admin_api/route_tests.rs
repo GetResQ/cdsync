@@ -5,11 +5,12 @@ use crate::config::{
     StateConfig, StatsConfig, SyncConfig,
 };
 use crate::state::{ConnectionState, PostgresCdcState};
-use crate::stats::{RunSummary, TableStatsSnapshot};
+use crate::stats::{RunSummary, StatsHandle, TableStatsSnapshot};
 use crate::types::TableCheckpoint;
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use chrono::{TimeZone, Utc};
+use futures::StreamExt;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::Client;
 use std::collections::HashMap;
@@ -377,7 +378,14 @@ fn test_admin_state(
     state_store: Arc<dyn AdminStateBackend>,
     stats_db: Option<Arc<dyn AdminStatsBackend>>,
 ) -> AdminApiState {
-    let cfg = test_config();
+    test_admin_state_with_config(test_config(), state_store, stats_db)
+}
+
+fn test_admin_state_with_config(
+    cfg: Config,
+    state_store: Arc<dyn AdminStateBackend>,
+    stats_db: Option<Arc<dyn AdminStatsBackend>>,
+) -> AdminApiState {
     let auth_verifier = Arc::new(
         AdminApiServiceJwtVerifier::from_config(
             cfg.admin_api
@@ -400,6 +408,88 @@ fn test_admin_state(
         deploy_revision: Some("deploy-123".to_string()),
         last_restart_reason: "startup".to_string(),
     }
+}
+
+#[tokio::test]
+async fn load_current_run_view_prefers_live_run_snapshot() -> anyhow::Result<()> {
+    let connection_id = "app_live_stats";
+    let stats = StatsHandle::new(connection_id);
+    stats.record_extract("public.accounts", 7, 15).await;
+    stats.record_load("public.accounts", 7, 7, 0, 20).await;
+
+    let mut cfg = test_config();
+    cfg.connections[0].id = connection_id.to_string();
+    let mut sync_state = test_state();
+    let connection_state = sync_state
+        .connections
+        .remove("app")
+        .expect("seed connection state");
+    sync_state
+        .connections
+        .insert(connection_id.to_string(), connection_state);
+
+    let state = test_admin_state_with_config(
+        cfg,
+        Arc::new(FakeStateBackend {
+            state: sync_state,
+            ping_error: None,
+        }),
+        Some(Arc::new(FakeStatsBackend::default())),
+    );
+
+    let (current_run, tables, live_snapshot) =
+        super::load_current_run_view(&state, connection_id).await?;
+    assert_eq!(current_run.expect("current run").rows_read, 7);
+    assert_eq!(tables[0].rows_written, 7);
+    assert_eq!(live_snapshot.expect("live snapshot").load_ms, 20);
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_api_stream_route_emits_sse_frames() -> anyhow::Result<()> {
+    let mut cfg = test_config();
+    if let SourceConfig::Postgres(pg) = &mut cfg.connections[0].source {
+        pg.cdc = Some(false);
+    }
+
+    let state = test_admin_state_with_config(
+        cfg,
+        Arc::new(FakeStateBackend {
+            state: test_state(),
+            ping_error: None,
+        }),
+        Some(Arc::new(FakeStatsBackend::default())),
+    );
+    let (base_url, handle) = spawn_test_server(state).await?;
+    let client = Client::new();
+    let auth = auth_header(&["cdsync:admin"]);
+
+    let response = client
+        .get(format!("{base_url}/v1/stream?connection=app"))
+        .header("Authorization", &auth)
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let mut bytes_stream = response.bytes_stream();
+    let first_chunk = timeout(Duration::from_secs(5), bytes_stream.next())
+        .await?
+        .context("missing first SSE chunk")??;
+    let body = String::from_utf8(first_chunk.to_vec()).expect("utf8 chunk");
+    assert!(body.contains("event: service.heartbeat"));
+    assert!(body.contains("\"connection_id\":\"app\""));
+
+    handle.abort();
+    let _ = handle.await;
+    Ok(())
 }
 
 #[tokio::test]

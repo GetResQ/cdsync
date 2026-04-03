@@ -21,7 +21,7 @@ impl Config {
         let cfg: Config = if path.extension().and_then(|e| e.to_str()) == Some("toml") {
             toml::from_str(&contents)?
         } else {
-            serde_yaml::from_str(&contents)?
+            yaml_serde::from_str(&contents)?
         };
         cfg.validate()?;
         Ok(cfg)
@@ -675,7 +675,7 @@ connections:
       project_id: "proj"
       dataset: "ds"
 "#;
-        let cfg: Config = serde_yaml::from_str(raw).expect("config parses");
+        let cfg: Config = yaml_serde::from_str(raw).expect("config parses");
         assert!(cfg.validate().is_err());
     }
 
@@ -699,7 +699,7 @@ connections:
       project_id: "proj"
       dataset: "ds"
 "#;
-        let cfg: Config = serde_yaml::from_str(raw).expect("config parses");
+        let cfg: Config = yaml_serde::from_str(raw).expect("config parses");
         let err = cfg.validate().expect_err("missing cdc pipeline id");
         assert!(
             err.to_string()
@@ -726,7 +726,7 @@ connections:
       project_id: "proj"
       dataset: "ds"
 "#;
-        let cfg: Config = serde_yaml::from_str(raw).expect("config parses");
+        let cfg: Config = yaml_serde::from_str(raw).expect("config parses");
         assert!(cfg.validate().is_ok());
     }
 
@@ -752,7 +752,7 @@ connections:
       project_id: "proj"
       dataset: "ds"
 "#;
-        let cfg: Config = serde_yaml::from_str(raw).expect("config parses");
+        let cfg: Config = yaml_serde::from_str(raw).expect("config parses");
         let metadata = cfg.metadata_columns();
         assert_eq!(metadata.synced_at, "_synced_custom");
         assert_eq!(metadata.deleted_at, "_deleted_custom");
@@ -830,7 +830,7 @@ connections:
       project_id: "proj"
       dataset: "ds"
 "#;
-        let cfg: Config = serde_yaml::from_str(raw).expect("config parses");
+        let cfg: Config = yaml_serde::from_str(raw).expect("config parses");
         assert!(cfg.validate().is_err());
     }
 }

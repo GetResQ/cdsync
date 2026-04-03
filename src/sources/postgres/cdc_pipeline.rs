@@ -5,6 +5,7 @@ pub(super) struct CommittedCdcBatch {
     pub(super) commit_lsn: etl::types::PgLsn,
     pub(super) table_batches: Vec<CdcTableApplyBatch>,
     pub(super) stats: HashMap<TableId, usize>,
+    pub(super) extract_ms: u64,
 }
 
 pub(super) struct CdcTableApplyBatch {
@@ -20,11 +21,13 @@ pub(super) struct CommitTrackerEntry {
     pub(super) commit_lsn: etl::types::PgLsn,
     pub(super) remaining_fragments: usize,
     pub(super) stats: HashMap<TableId, usize>,
+    pub(super) extract_ms: u64,
 }
 
 pub(super) struct CdcWatermarkAdvance {
     pub(super) commit_lsn: etl::types::PgLsn,
     pub(super) stats: HashMap<TableId, usize>,
+    pub(super) extract_ms: u64,
 }
 
 #[derive(Default)]
@@ -64,6 +67,7 @@ impl CdcWatermarkTracker {
         sequence: u64,
         commit_lsn: etl::types::PgLsn,
         stats: HashMap<TableId, usize>,
+        extract_ms: u64,
         fragment_count: usize,
     ) {
         self.commits.insert(
@@ -72,6 +76,7 @@ impl CdcWatermarkTracker {
                 commit_lsn,
                 remaining_fragments: fragment_count,
                 stats,
+                extract_ms,
             },
         );
     }
@@ -94,6 +99,7 @@ impl CdcWatermarkTracker {
     fn advance_ready(&mut self) -> Option<CdcWatermarkAdvance> {
         let mut last_lsn = None;
         let mut stats = HashMap::new();
+        let mut extract_ms = 0u64;
 
         while let Some(entry) = self.commits.get(&self.next_sequence) {
             if entry.remaining_fragments != 0 {
@@ -104,10 +110,15 @@ impl CdcWatermarkTracker {
             for (table_id, count) in entry.stats {
                 *stats.entry(table_id).or_insert(0) += count;
             }
+            extract_ms = extract_ms.saturating_add(entry.extract_ms);
             self.next_sequence += 1;
         }
 
-        last_lsn.map(|commit_lsn| CdcWatermarkAdvance { commit_lsn, stats })
+        last_lsn.map(|commit_lsn| CdcWatermarkAdvance {
+            commit_lsn,
+            stats,
+            extract_ms,
+        })
     }
 }
 
@@ -171,6 +182,7 @@ pub(super) fn dispatch_cdc_batches(
             batch.sequence,
             batch.commit_lsn,
             batch.stats,
+            batch.extract_ms,
             fragment_count,
         );
 
@@ -286,9 +298,18 @@ pub(super) async fn apply_cdc_watermark_advance(
     last_flushed_lsn: &mut etl::types::PgLsn,
 ) -> Result<()> {
     if let Some(stats) = runtime.stats {
-        for (table_id, count) in &advance.stats {
+        let total_rows = advance.stats.values().copied().sum::<usize>().max(1) as u64;
+        let mut remaining_ms = advance.extract_ms;
+        for (index, (table_id, count)) in advance.stats.iter().enumerate() {
             if let Some(cfg) = runtime.table_configs.get(table_id) {
-                stats.record_extract(&cfg.name, *count, 0).await;
+                let count_u64 = (*count).max(1) as u64;
+                let extract_ms = if index + 1 == advance.stats.len() {
+                    remaining_ms
+                } else {
+                    (advance.extract_ms.saturating_mul(count_u64)) / total_rows
+                };
+                remaining_ms = remaining_ms.saturating_sub(extract_ms);
+                stats.record_extract(&cfg.name, *count, extract_ms).await;
             }
         }
     }

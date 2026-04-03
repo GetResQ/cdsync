@@ -8,7 +8,7 @@ use crate::config::{
 };
 use crate::runner::ShutdownSignal;
 use crate::state::{ConnectionState, SyncState, SyncStateStore};
-use crate::stats::{RunSummary, StatsDb, TableStatsSnapshot};
+use crate::stats::{RunStatsSnapshot, RunSummary, StatsDb, TableStatsSnapshot, live_run_snapshot, summarize_run};
 use crate::types::TableCheckpoint;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -16,26 +16,35 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use futures::future::join_all;
+use futures::stream::{self, Stream};
 use jsonwebtoken::crypto::rust_crypto::DEFAULT_PROVIDER as JWT_CRYPTO_PROVIDER;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use sqlx::postgres::PgPoolOptions;
+use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{MissedTickBehavior, timeout};
 use tracing::warn;
 use url::Url;
+
+const STREAM_INTERVAL: Duration = Duration::from_secs(2);
+const STREAM_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const STREAM_ACTIVE_TABLE_LIMIT: usize = 25;
 
 #[derive(Clone)]
 pub struct AdminApiState {
@@ -343,7 +352,7 @@ struct CheckpointResponse {
     state: Option<ConnectionState>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ProgressResponse {
     connection_id: String,
     state: Option<ConnectionState>,
@@ -352,7 +361,7 @@ struct ProgressResponse {
     tables: Vec<TableProgress>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct TableProgress {
     table_name: String,
     checkpoint: Option<TableCheckpoint>,
@@ -365,7 +374,7 @@ struct TableProgress {
     snapshot_chunks_complete: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ConnectionRuntime {
     connection_id: String,
     phase: &'static str,
@@ -503,6 +512,11 @@ struct RunsQuery {
     limit: Option<usize>,
 }
 
+#[derive(serde::Deserialize)]
+struct StreamQuery {
+    connection: String,
+}
+
 #[derive(Clone, Copy)]
 struct RuntimeMetadata<'a> {
     config_hash: &'a str,
@@ -515,7 +529,81 @@ enum PostgresCdcRuntimeState {
     Following,
     Initializing,
     ContinuityLost,
-    Unknown,
+}
+
+#[derive(Debug, Clone)]
+struct PostgresCdcSlotSnapshot {
+    slot_name: String,
+    active: bool,
+    restart_lsn: Option<String>,
+    confirmed_flush_lsn: Option<String>,
+    current_wal_lsn: Option<String>,
+    wal_bytes_retained_by_slot: Option<i64>,
+    wal_bytes_behind_confirmed: Option<i64>,
+    continuity_lost: bool,
+}
+
+#[derive(Serialize)]
+struct StreamEnvelope<T> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    connection_id: String,
+    seq: u64,
+    at: DateTime<Utc>,
+    data: T,
+}
+
+#[derive(Serialize)]
+struct ServiceHeartbeatData {
+    service: &'static str,
+    version: &'static str,
+    started_at: DateTime<Utc>,
+    uptime_seconds: i64,
+    mode: String,
+    deploy_revision: Option<String>,
+    config_hash: String,
+    last_restart_reason: String,
+}
+
+#[derive(Serialize)]
+struct ConnectionThroughputData {
+    run_id: Option<String>,
+    status: Option<String>,
+    rows_read_total: i64,
+    rows_written_total: i64,
+    rows_deleted_total: i64,
+    rows_upserted_total: i64,
+    extract_ms_total: i64,
+    load_ms_total: i64,
+    rows_read_per_sec: Option<f64>,
+    rows_written_per_sec: Option<f64>,
+    rows_deleted_per_sec: Option<f64>,
+    rows_upserted_per_sec: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct ConnectionCdcData {
+    slot_name: Option<String>,
+    slot_active: Option<bool>,
+    current_wal_lsn: Option<String>,
+    restart_lsn: Option<String>,
+    confirmed_flush_lsn: Option<String>,
+    wal_bytes_retained_by_slot: Option<i64>,
+    wal_bytes_behind_confirmed: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct StreamErrorData {
+    message: String,
+}
+
+struct StreamCursor {
+    state: AdminApiState,
+    connection_id: String,
+    seq: u64,
+    interval: tokio::time::Interval,
+    pending_events: VecDeque<SseEvent>,
+    previous_run_snapshot: Option<(DateTime<Utc>, RunStatsSnapshot)>,
 }
 
 const CDC_SLOT_INSPECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -604,6 +692,7 @@ fn router(state: AdminApiState) -> Router {
     let v1 = Router::new()
         .route("/v1/status", get(status))
         .route("/v1/config", get(config))
+        .route("/v1/stream", get(stream))
         .route("/v1/connections", get(connections))
         .route("/v1/connections/{id}", get(connection))
         .route("/v1/connections/{id}/runtime", get(connection_runtime))
@@ -850,6 +939,64 @@ async fn progress(
     }))
 }
 
+async fn stream(
+    State(state): State<AdminApiState>,
+    Query(query): Query<StreamQuery>,
+) -> Result<Sse<impl Stream<Item = Result<SseEvent, Infallible>>>, AdminApiError> {
+    state
+        .cfg
+        .connections
+        .iter()
+        .find(|connection| connection.id == query.connection)
+        .context("connection not found")?;
+
+    let mut interval = tokio::time::interval(STREAM_INTERVAL);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    let stream = stream::unfold(
+        StreamCursor {
+            state,
+            connection_id: query.connection,
+            seq: 0,
+            interval,
+            pending_events: VecDeque::new(),
+            previous_run_snapshot: None,
+        },
+        |mut cursor| async move {
+            loop {
+                if let Some(event) = cursor.pending_events.pop_front() {
+                    return Some((Ok(event), cursor));
+                }
+
+                cursor.interval.tick().await;
+                cursor.pending_events = match build_stream_events(&mut cursor).await {
+                    Ok(events) => events,
+                    Err(err) => {
+                        let mut events = VecDeque::new();
+                        if let Ok(event) = next_stream_event(
+                            &mut cursor.seq,
+                            &cursor.connection_id,
+                            "stream.error",
+                            StreamErrorData {
+                                message: err.to_string(),
+                            },
+                        ) {
+                            events.push_back(event);
+                        }
+                        events
+                    }
+                };
+            }
+        },
+    );
+
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(STREAM_KEEP_ALIVE_INTERVAL)
+            .text("keep-alive"),
+    ))
+}
+
 async fn connection_tables(
     State(state): State<AdminApiState>,
     Path(connection_id): Path<String>,
@@ -894,6 +1041,247 @@ async fn connection_tables(
         runtime.reason_code,
         cdc_runtime_state,
     )))
+}
+
+async fn build_stream_events(cursor: &mut StreamCursor) -> anyhow::Result<VecDeque<SseEvent>> {
+    let now = Utc::now();
+    let connection = cursor
+        .state
+        .cfg
+        .connections
+        .iter()
+        .find(|connection| connection.id == cursor.connection_id)
+        .context("connection not found")?;
+    let sync_state = cursor.state.state_store.load_state().await?;
+    let connection_state = sync_state.connections.get(&cursor.connection_id).cloned();
+    let (current_run, run_tables, live_snapshot) =
+        load_current_run_view(&cursor.state, &cursor.connection_id).await?;
+    let cdc_runtime_state =
+        load_postgres_cdc_runtime_state(connection, connection_state.as_ref()).await;
+    let cdc_slot_snapshot = load_postgres_cdc_slot_snapshot(connection, connection_state.as_ref()).await;
+    let runtime = derive_connection_runtime(
+        connection,
+        connection_state.as_ref(),
+        current_run.as_ref(),
+        cdc_runtime_state,
+        now,
+        RuntimeMetadata {
+            config_hash: &cursor.state.config_hash,
+            deploy_revision: cursor.state.deploy_revision.as_deref(),
+            last_restart_reason: &cursor.state.last_restart_reason,
+        },
+    );
+    let tables = build_table_progress(
+        connection,
+        connection_state.as_ref(),
+        &run_tables,
+        now,
+        runtime.reason_code,
+        cdc_runtime_state,
+    );
+
+    let mut events = VecDeque::new();
+    events.push_back(next_stream_event(
+        &mut cursor.seq,
+        &cursor.connection_id,
+        "service.heartbeat",
+        ServiceHeartbeatData {
+            service: "cdsync",
+            version: env!("CARGO_PKG_VERSION"),
+            started_at: cursor.state.started_at,
+            uptime_seconds: (now - cursor.state.started_at).num_seconds().max(0),
+            mode: cursor.state.mode.clone(),
+            deploy_revision: cursor.state.deploy_revision.clone(),
+            config_hash: cursor.state.config_hash.clone(),
+            last_restart_reason: cursor.state.last_restart_reason.clone(),
+        },
+    )?);
+    events.push_back(next_stream_event(
+        &mut cursor.seq,
+        &cursor.connection_id,
+        "connection.runtime",
+        &runtime,
+    )?);
+    events.push_back(next_stream_event(
+        &mut cursor.seq,
+        &cursor.connection_id,
+        "connection.throughput",
+        build_connection_throughput_event(
+            current_run.as_ref(),
+            live_snapshot.as_ref(),
+            &mut cursor.previous_run_snapshot,
+            now,
+        ),
+    )?);
+    events.push_back(next_stream_event(
+        &mut cursor.seq,
+        &cursor.connection_id,
+        "connection.cdc",
+        ConnectionCdcData {
+            slot_name: cdc_slot_snapshot.as_ref().map(|snapshot| snapshot.slot_name.clone()),
+            slot_active: cdc_slot_snapshot.as_ref().map(|snapshot| snapshot.active),
+            current_wal_lsn: cdc_slot_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.current_wal_lsn.clone()),
+            restart_lsn: cdc_slot_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.restart_lsn.clone()),
+            confirmed_flush_lsn: cdc_slot_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.confirmed_flush_lsn.clone()),
+            wal_bytes_retained_by_slot: cdc_slot_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.wal_bytes_retained_by_slot),
+            wal_bytes_behind_confirmed: cdc_slot_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.wal_bytes_behind_confirmed),
+        },
+    )?);
+
+    let active_tables = select_active_tables(&tables);
+    if !active_tables.is_empty() {
+        events.push_back(next_stream_event(
+            &mut cursor.seq,
+            &cursor.connection_id,
+            "table.progress",
+            &active_tables,
+        )?);
+    }
+
+    let snapshot_tables = select_snapshot_tables(&tables);
+    if !snapshot_tables.is_empty() {
+        events.push_back(next_stream_event(
+            &mut cursor.seq,
+            &cursor.connection_id,
+            "snapshot.progress",
+            &snapshot_tables,
+        )?);
+    }
+
+    Ok(events)
+}
+
+async fn load_current_run_view(
+    state: &AdminApiState,
+    connection_id: &str,
+) -> anyhow::Result<(
+    Option<RunSummary>,
+    Vec<TableStatsSnapshot>,
+    Option<RunStatsSnapshot>,
+)> {
+    if let Some(snapshot) = live_run_snapshot(connection_id) {
+        return Ok((Some(summarize_run(&snapshot)), snapshot.tables.clone(), Some(snapshot)));
+    }
+
+    if let Some(stats_db) = &state.stats_db {
+        let runs = stats_db.recent_runs(Some(connection_id), 1).await?;
+        if let Some(run) = runs.into_iter().next() {
+            let tables = stats_db.run_tables(&run.run_id).await?;
+            return Ok((Some(run), tables, None));
+        }
+    }
+
+    Ok((None, Vec::new(), None))
+}
+
+fn build_connection_throughput_event(
+    current_run: Option<&RunSummary>,
+    live_snapshot: Option<&RunStatsSnapshot>,
+    previous_run_snapshot: &mut Option<(DateTime<Utc>, RunStatsSnapshot)>,
+    now: DateTime<Utc>,
+) -> ConnectionThroughputData {
+    let mut event = ConnectionThroughputData {
+        run_id: current_run.map(|run| run.run_id.clone()),
+        status: current_run.and_then(|run| run.status.clone()),
+        rows_read_total: current_run.map(|run| run.rows_read).unwrap_or_default(),
+        rows_written_total: current_run.map(|run| run.rows_written).unwrap_or_default(),
+        rows_deleted_total: current_run.map(|run| run.rows_deleted).unwrap_or_default(),
+        rows_upserted_total: current_run.map(|run| run.rows_upserted).unwrap_or_default(),
+        extract_ms_total: current_run.map(|run| run.extract_ms).unwrap_or_default(),
+        load_ms_total: current_run.map(|run| run.load_ms).unwrap_or_default(),
+        rows_read_per_sec: None,
+        rows_written_per_sec: None,
+        rows_deleted_per_sec: None,
+        rows_upserted_per_sec: None,
+    };
+
+    let Some(live_snapshot) = live_snapshot else {
+        return event;
+    };
+
+    if let Some((previous_at, previous_snapshot)) = previous_run_snapshot.as_ref()
+        && previous_snapshot.run_id == live_snapshot.run_id
+    {
+        let elapsed_ms = (now - *previous_at).num_milliseconds().max(1) as f64;
+        let elapsed_seconds = elapsed_ms / 1000.0;
+        event.rows_read_per_sec = Some(
+            ((live_snapshot.rows_read - previous_snapshot.rows_read).max(0) as f64)
+                / elapsed_seconds,
+        );
+        event.rows_written_per_sec = Some(
+            ((live_snapshot.rows_written - previous_snapshot.rows_written).max(0) as f64)
+                / elapsed_seconds,
+        );
+        event.rows_deleted_per_sec = Some(
+            ((live_snapshot.rows_deleted - previous_snapshot.rows_deleted).max(0) as f64)
+                / elapsed_seconds,
+        );
+        event.rows_upserted_per_sec = Some(
+            ((live_snapshot.rows_upserted - previous_snapshot.rows_upserted).max(0) as f64)
+                / elapsed_seconds,
+        );
+    }
+
+    *previous_run_snapshot = Some((now, live_snapshot.clone()));
+    event
+}
+
+fn select_active_tables(tables: &[TableProgress]) -> Vec<TableProgress> {
+    tables
+        .iter()
+        .filter(|table| {
+            table.phase != "healthy"
+                || table.snapshot_chunks_total > 0
+                || table.stats.as_ref().is_some_and(|stats| {
+                    stats.rows_read > 0
+                        || stats.rows_written > 0
+                        || stats.rows_deleted > 0
+                        || stats.rows_upserted > 0
+                })
+        })
+        .take(STREAM_ACTIVE_TABLE_LIMIT)
+        .cloned()
+        .collect()
+}
+
+fn select_snapshot_tables(tables: &[TableProgress]) -> Vec<TableProgress> {
+    tables
+        .iter()
+        .filter(|table| {
+            table.snapshot_chunks_total > 0
+                && table.snapshot_chunks_complete < table.snapshot_chunks_total
+        })
+        .take(STREAM_ACTIVE_TABLE_LIMIT)
+        .cloned()
+        .collect()
+}
+
+fn next_stream_event<T: Serialize>(
+    seq: &mut u64,
+    connection_id: &str,
+    event_type: &'static str,
+    data: T,
+) -> anyhow::Result<SseEvent> {
+    *seq += 1;
+    Ok(SseEvent::default()
+        .event(event_type)
+        .json_data(StreamEnvelope {
+            event_type,
+            connection_id: connection_id.to_string(),
+            seq: *seq,
+            at: Utc::now(),
+            data,
+        })?)
 }
 
 fn active_checkpoint_map<'a>(
@@ -959,10 +1347,10 @@ fn classify_error_reason(error: Option<&str>) -> &'static str {
     }
 }
 
-async fn load_postgres_cdc_runtime_state(
+async fn load_postgres_cdc_slot_snapshot(
     connection: &ConnectionConfig,
     state: Option<&ConnectionState>,
-) -> Option<PostgresCdcRuntimeState> {
+) -> Option<PostgresCdcSlotSnapshot> {
     let SourceConfig::Postgres(pg) = &connection.source else {
         return None;
     };
@@ -975,15 +1363,11 @@ async fn load_postgres_cdc_runtime_state(
         .and_then(|cdc_state| cdc_state.slot_name.clone())
         .or_else(|| {
             crate::sources::postgres::admin_cdc_slot_name(&connection.id, pg.cdc_pipeline_id).ok()
-        });
+        })?;
     let has_last_lsn = state
         .and_then(|state| state.postgres_cdc.as_ref())
         .and_then(|cdc_state| cdc_state.last_lsn.as_ref())
         .is_some();
-
-    let Some(slot_name) = slot_name else {
-        return Some(PostgresCdcRuntimeState::Initializing);
-    };
 
     let pool = match PgPoolOptions::new()
         .max_connections(1)
@@ -995,9 +1379,9 @@ async fn load_postgres_cdc_runtime_state(
             warn!(
                 connection = %connection.id,
                 error = %err,
-                "failed to inspect postgres CDC slot state"
+                "failed to inspect postgres CDC slot snapshot"
             );
-            return Some(PostgresCdcRuntimeState::Unknown);
+            return None;
         }
     };
 
@@ -1005,7 +1389,12 @@ async fn load_postgres_cdc_runtime_state(
         CDC_SLOT_INSPECTION_TIMEOUT,
         sqlx::query(
             r#"
-            select active
+            select active,
+                   restart_lsn::text as restart_lsn,
+                   confirmed_flush_lsn::text as confirmed_flush_lsn,
+                   pg_current_wal_lsn()::text as current_wal_lsn,
+                   pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint as retained_bytes,
+                   pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint as behind_confirmed_bytes
             from pg_replication_slots
             where slot_type = 'logical'
               and slot_name = $1
@@ -1022,31 +1411,62 @@ async fn load_postgres_cdc_runtime_state(
                 connection = %connection.id,
                 slot_name = %slot_name,
                 error = %err,
-                "failed to query postgres CDC slot state"
+                "failed to query postgres CDC slot snapshot"
             );
-            return Some(PostgresCdcRuntimeState::Unknown);
+            return None;
         }
         Err(_) => {
             warn!(
                 connection = %connection.id,
                 slot_name = %slot_name,
-                "timed out while inspecting postgres CDC slot state"
+                "timed out while inspecting postgres CDC slot snapshot"
             );
-            return Some(PostgresCdcRuntimeState::Unknown);
+            return None;
         }
     };
 
     match row {
-        Some(row) => {
-            let active: bool = row.try_get("active").unwrap_or(false);
-            if active {
-                Some(PostgresCdcRuntimeState::Following)
-            } else {
-                Some(PostgresCdcRuntimeState::Initializing)
-            }
-        }
-        None if has_last_lsn => Some(PostgresCdcRuntimeState::ContinuityLost),
-        None => Some(PostgresCdcRuntimeState::Initializing),
+        Some(row) => Some(PostgresCdcSlotSnapshot {
+            slot_name,
+            active: row.try_get("active").unwrap_or(false),
+            restart_lsn: row.try_get("restart_lsn").ok(),
+            confirmed_flush_lsn: row.try_get("confirmed_flush_lsn").ok(),
+            current_wal_lsn: row.try_get("current_wal_lsn").ok(),
+            wal_bytes_retained_by_slot: row.try_get("retained_bytes").ok(),
+            wal_bytes_behind_confirmed: row.try_get("behind_confirmed_bytes").ok(),
+            continuity_lost: false,
+        }),
+        None => Some(PostgresCdcSlotSnapshot {
+            slot_name,
+            active: false,
+            restart_lsn: None,
+            confirmed_flush_lsn: None,
+            current_wal_lsn: None,
+            wal_bytes_retained_by_slot: None,
+            wal_bytes_behind_confirmed: None,
+            continuity_lost: has_last_lsn,
+        }),
+    }
+}
+
+async fn load_postgres_cdc_runtime_state(
+    connection: &ConnectionConfig,
+    state: Option<&ConnectionState>,
+) -> Option<PostgresCdcRuntimeState> {
+    let SourceConfig::Postgres(pg) = &connection.source else {
+        return None;
+    };
+    if !pg.cdc.unwrap_or(true) {
+        return None;
+    }
+
+    let snapshot = load_postgres_cdc_slot_snapshot(connection, state).await?;
+    if snapshot.active {
+        Some(PostgresCdcRuntimeState::Following)
+    } else if snapshot.continuity_lost {
+        Some(PostgresCdcRuntimeState::ContinuityLost)
+    } else {
+        Some(PostgresCdcRuntimeState::Initializing)
     }
 }
 
@@ -1081,7 +1501,6 @@ fn derive_connection_runtime(
         Some("running") => match cdc_runtime_state {
             Some(PostgresCdcRuntimeState::Following) => ("running", "cdc_following"),
             Some(PostgresCdcRuntimeState::ContinuityLost) => ("blocked", "cdc_continuity_lost"),
-            Some(PostgresCdcRuntimeState::Unknown) => ("starting", "cdc_state_unknown"),
             Some(PostgresCdcRuntimeState::Initializing) => ("starting", "cdc_initializing"),
             None => ("syncing", "sync_in_progress"),
         },
@@ -1180,7 +1599,6 @@ fn build_table_progress(
                     Some(PostgresCdcRuntimeState::ContinuityLost) => {
                         ("blocked", "cdc_continuity_lost")
                     }
-                    Some(PostgresCdcRuntimeState::Unknown) => ("pending", "cdc_state_unknown"),
                     Some(PostgresCdcRuntimeState::Initializing) => ("pending", "cdc_initializing"),
                     None => ("syncing", "sync_in_progress"),
                 },

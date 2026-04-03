@@ -111,6 +111,7 @@ impl PostgresSource {
         let mut last_received_lsn = start_lsn;
         let mut last_flushed_lsn = start_lsn;
         let mut last_xlog_activity = Instant::now();
+        let mut tx_extract_started_at: Option<Instant> = None;
         let mut in_tx = false;
         let mut expected_commit_lsn: Option<etl::types::PgLsn> = None;
         let mut shutdown = shutdown;
@@ -336,6 +337,7 @@ impl PostgresSource {
                     match xlog.data() {
                         LogicalReplicationMessage::Begin(begin) => {
                             in_tx = true;
+                            tx_extract_started_at = Some(Instant::now());
                             expected_commit_lsn = Some(etl::types::PgLsn::from(begin.final_lsn()));
                             pending_events.clear();
                             pending_stats.clear();
@@ -355,11 +357,16 @@ impl PostgresSource {
                             let table_batches =
                                 split_commit_events_by_table(std::mem::take(&mut pending_events));
                             let stats_by_table = std::mem::take(&mut pending_stats);
+                            let extract_ms = tx_extract_started_at
+                                .take()
+                                .map(|started_at| started_at.elapsed().as_millis() as u64)
+                                .unwrap_or_default();
                             queued_batches.push_back(CommittedCdcBatch {
                                 sequence: next_commit_sequence,
                                 commit_lsn,
                                 table_batches,
                                 stats: stats_by_table,
+                                extract_ms,
                             });
                             next_commit_sequence += 1;
 

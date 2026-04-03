@@ -5,14 +5,17 @@ use sqlx::Row;
 use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
+use tokio::sync::{Mutex as AsyncMutex, watch};
 use uuid::Uuid;
 static STATS_MIGRATOR: Migrator = sqlx::migrate!("./migrations/stats");
+static LIVE_RUN_REGISTRY: OnceLock<Mutex<HashMap<String, watch::Sender<RunStatsSnapshot>>>> =
+    OnceLock::new();
 
 #[derive(Clone)]
 pub struct StatsHandle {
-    inner: Arc<Mutex<RunStatsState>>,
+    inner: Arc<AsyncMutex<RunStatsState>>,
+    live_tx: watch::Sender<RunStatsSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,9 +117,16 @@ impl StatsHandle {
             rate_limit_hits: 0,
             tables: HashMap::new(),
         };
+        let snapshot = snapshot_from_state(&state);
+        let (live_tx, _live_rx) = watch::channel(snapshot.clone());
+        live_run_registry()
+            .lock()
+            .expect("live run registry lock poisoned")
+            .insert(connection_id.to_string(), live_tx.clone());
 
         Self {
-            inner: Arc::new(Mutex::new(state)),
+            inner: Arc::new(AsyncMutex::new(state)),
+            live_tx,
         }
     }
 
@@ -125,6 +135,7 @@ impl StatsHandle {
         guard.finished_at = Some(Utc::now());
         guard.status = Some(status.to_string());
         guard.error = error;
+        self.live_tx.send_replace(snapshot_from_state(&guard));
     }
 
     pub async fn run_id(&self) -> String {
@@ -141,6 +152,7 @@ impl StatsHandle {
         table_stats.rows_read += rows;
         table_stats.extract_ms += elapsed_ms as i64;
         crate::telemetry::record_rows_read(table, rows as u64);
+        self.live_tx.send_replace(snapshot_from_state(&guard));
     }
 
     pub async fn record_load(
@@ -165,6 +177,7 @@ impl StatsHandle {
         table_stats.rows_deleted += deleted;
         table_stats.load_ms += elapsed_ms as i64;
         crate::telemetry::record_rows_written(table, rows as u64);
+        self.live_tx.send_replace(snapshot_from_state(&guard));
     }
 
     pub async fn record_api_call(&self, rate_limited: bool) {
@@ -173,42 +186,78 @@ impl StatsHandle {
         if rate_limited {
             guard.rate_limit_hits += 1;
         }
+        self.live_tx.send_replace(snapshot_from_state(&guard));
     }
 
     pub async fn snapshot(&self) -> RunStatsSnapshot {
         let guard = self.inner.lock().await;
-        let tables = guard
-            .tables
-            .iter()
-            .map(|(name, stats)| TableStatsSnapshot {
-                run_id: guard.run_id.clone(),
-                connection_id: guard.connection_id.clone(),
-                table_name: name.clone(),
-                rows_read: stats.rows_read,
-                rows_written: stats.rows_written,
-                rows_deleted: stats.rows_deleted,
-                rows_upserted: stats.rows_upserted,
-                extract_ms: stats.extract_ms,
-                load_ms: stats.load_ms,
-            })
-            .collect();
-        RunStatsSnapshot {
-            run_id: guard.run_id.clone(),
-            connection_id: guard.connection_id.clone(),
-            started_at: guard.started_at,
-            finished_at: guard.finished_at,
-            status: guard.status.clone(),
-            error: guard.error.clone(),
-            rows_read: guard.rows_read,
-            rows_written: guard.rows_written,
-            rows_deleted: guard.rows_deleted,
-            rows_upserted: guard.rows_upserted,
-            extract_ms: guard.extract_ms,
-            load_ms: guard.load_ms,
-            api_calls: guard.api_calls,
-            rate_limit_hits: guard.rate_limit_hits,
-            tables,
-        }
+        snapshot_from_state(&guard)
+    }
+}
+
+pub fn live_run_snapshot(connection_id: &str) -> Option<RunStatsSnapshot> {
+    live_run_registry()
+        .lock()
+        .expect("live run registry lock poisoned")
+        .get(connection_id)
+        .map(|sender| sender.borrow().clone())
+}
+
+pub fn summarize_run(snapshot: &RunStatsSnapshot) -> RunSummary {
+    RunSummary {
+        run_id: snapshot.run_id.clone(),
+        connection_id: snapshot.connection_id.clone(),
+        started_at: snapshot.started_at,
+        finished_at: snapshot.finished_at,
+        status: snapshot.status.clone(),
+        error: snapshot.error.clone(),
+        rows_read: snapshot.rows_read,
+        rows_written: snapshot.rows_written,
+        rows_deleted: snapshot.rows_deleted,
+        rows_upserted: snapshot.rows_upserted,
+        extract_ms: snapshot.extract_ms,
+        load_ms: snapshot.load_ms,
+        api_calls: snapshot.api_calls,
+        rate_limit_hits: snapshot.rate_limit_hits,
+    }
+}
+
+fn live_run_registry() -> &'static Mutex<HashMap<String, watch::Sender<RunStatsSnapshot>>> {
+    LIVE_RUN_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn snapshot_from_state(state: &RunStatsState) -> RunStatsSnapshot {
+    let tables = state
+        .tables
+        .iter()
+        .map(|(name, stats)| TableStatsSnapshot {
+            run_id: state.run_id.clone(),
+            connection_id: state.connection_id.clone(),
+            table_name: name.clone(),
+            rows_read: stats.rows_read,
+            rows_written: stats.rows_written,
+            rows_deleted: stats.rows_deleted,
+            rows_upserted: stats.rows_upserted,
+            extract_ms: stats.extract_ms,
+            load_ms: stats.load_ms,
+        })
+        .collect();
+    RunStatsSnapshot {
+        run_id: state.run_id.clone(),
+        connection_id: state.connection_id.clone(),
+        started_at: state.started_at,
+        finished_at: state.finished_at,
+        status: state.status.clone(),
+        error: state.error.clone(),
+        rows_read: state.rows_read,
+        rows_written: state.rows_written,
+        rows_deleted: state.rows_deleted,
+        rows_upserted: state.rows_upserted,
+        extract_ms: state.extract_ms,
+        load_ms: state.load_ms,
+        api_calls: state.api_calls,
+        rate_limit_hits: state.rate_limit_hits,
+        tables,
     }
 }
 
