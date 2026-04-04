@@ -4,7 +4,7 @@ use crate::config::{
     MetadataConfig, ObservabilityConfig, PostgresConfig, PostgresTableConfig, SourceConfig,
     StateConfig, StatsConfig, SyncConfig,
 };
-use crate::state::{ConnectionState, PostgresCdcState};
+use crate::state::{CdcBatchLoadQueueSummary, ConnectionState, PostgresCdcState};
 use crate::stats::{RunSummary, StatsHandle, TableStatsSnapshot};
 use crate::types::TableCheckpoint;
 use async_trait::async_trait;
@@ -26,6 +26,7 @@ struct FakeStateBackend {
     state: SyncState,
     ping_error: Option<String>,
     load_delay: Option<Duration>,
+    batch_load_queue_summary: Option<CdcBatchLoadQueueSummary>,
 }
 
 #[async_trait]
@@ -52,6 +53,13 @@ impl AdminStateBackend for FakeStateBackend {
             sleep(delay).await;
         }
         Ok(self.state.connections.get(connection_id).cloned())
+    }
+
+    async fn load_cdc_batch_load_queue_summary(
+        &self,
+        _connection_id: &str,
+    ) -> anyhow::Result<CdcBatchLoadQueueSummary> {
+        Ok(self.batch_load_queue_summary.clone().unwrap_or_default())
     }
 }
 
@@ -80,6 +88,13 @@ impl AdminStateBackend for CountingStateBackend {
         self.load_connection_state_calls
             .fetch_add(1, Ordering::SeqCst);
         Ok(self.state.connections.get(connection_id).cloned())
+    }
+
+    async fn load_cdc_batch_load_queue_summary(
+        &self,
+        _connection_id: &str,
+    ) -> anyhow::Result<CdcBatchLoadQueueSummary> {
+        Ok(CdcBatchLoadQueueSummary::default())
     }
 }
 
@@ -451,6 +466,7 @@ async fn spawn_admin_server_thread_surfaces_bind_failures_before_returning() -> 
             state: test_state(),
             ping_error: None,
             load_delay: None,
+            batch_load_queue_summary: None,
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -492,6 +508,7 @@ async fn spawn_admin_server_thread_does_not_wait_for_initial_slot_samples() -> a
             state: test_state(),
             ping_error: None,
             load_delay: Some(Duration::from_millis(300)),
+            batch_load_queue_summary: None,
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -578,6 +595,7 @@ async fn load_current_run_view_prefers_live_run_snapshot() -> anyhow::Result<()>
             state: sync_state,
             ping_error: None,
             load_delay: None,
+            batch_load_queue_summary: None,
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -603,6 +621,7 @@ async fn admin_api_stream_route_emits_sse_frames() -> anyhow::Result<()> {
             state: test_state(),
             ping_error: None,
             load_delay: None,
+            batch_load_queue_summary: None,
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -645,6 +664,7 @@ async fn admin_api_stream_route_emits_cached_cdc_snapshot() -> anyhow::Result<()
             state: test_state(),
             ping_error: None,
             load_delay: None,
+            batch_load_queue_summary: None,
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -688,6 +708,7 @@ async fn admin_api_in_process_smoke_routes_work() -> anyhow::Result<()> {
             state: test_state(),
             ping_error: None,
             load_delay: None,
+            batch_load_queue_summary: None,
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -752,6 +773,7 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
             state: test_state(),
             ping_error: None,
             load_delay: None,
+            batch_load_queue_summary: None,
         }),
         Some(Arc::new(FakeStatsBackend {
             runs,
@@ -870,6 +892,7 @@ async fn admin_api_runs_route_returns_500_when_stats_disabled() -> anyhow::Resul
             state: test_state(),
             ping_error: None,
             load_delay: None,
+            batch_load_queue_summary: None,
         }),
         None,
     );
@@ -898,6 +921,7 @@ async fn admin_api_rejects_missing_or_wrong_scope_tokens() -> anyhow::Result<()>
             state: test_state(),
             ping_error: None,
             load_delay: None,
+            batch_load_queue_summary: None,
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -927,6 +951,7 @@ async fn admin_api_accepts_array_audience_tokens() -> anyhow::Result<()> {
             ping_error: None,
             state: test_state(),
             load_delay: None,
+            batch_load_queue_summary: None,
         }),
         Some(Arc::new(FakeStatsBackend {
             ping_error: None,

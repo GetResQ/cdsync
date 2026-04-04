@@ -7,7 +7,7 @@ use crate::config::{
     SalesforceConfig, SourceConfig, SyncConfig,
 };
 use crate::runner::ShutdownSignal;
-use crate::state::{ConnectionState, SyncState, SyncStateStore};
+use crate::state::{CdcBatchLoadQueueSummary, ConnectionState, SyncState, SyncStateStore};
 use crate::stats::{
     RunStatsSnapshot, RunSummary, StatsDb, TableStatsSnapshot, live_run_snapshot, summarize_run,
 };
@@ -112,6 +112,10 @@ trait AdminStateBackend: Send + Sync {
         &self,
         connection_id: &str,
     ) -> anyhow::Result<Option<ConnectionState>>;
+    async fn load_cdc_batch_load_queue_summary(
+        &self,
+        connection_id: &str,
+    ) -> anyhow::Result<CdcBatchLoadQueueSummary>;
 }
 
 #[async_trait]
@@ -140,6 +144,13 @@ impl AdminStateBackend for SyncStateStore {
         connection_id: &str,
     ) -> anyhow::Result<Option<ConnectionState>> {
         SyncStateStore::load_connection_state(self, connection_id).await
+    }
+
+    async fn load_cdc_batch_load_queue_summary(
+        &self,
+        connection_id: &str,
+    ) -> anyhow::Result<CdcBatchLoadQueueSummary> {
+        SyncStateStore::load_cdc_batch_load_queue_summary(self, connection_id).await
     }
 }
 
@@ -375,6 +386,7 @@ struct ProgressResponse {
     current_run: Option<RunSummary>,
     runtime: ConnectionRuntime,
     cdc: ConnectionCdcSnapshot,
+    batch_load_queue: Option<CdcBatchLoadQueueSummary>,
     tables: Vec<TableProgress>,
 }
 
@@ -761,6 +773,14 @@ fn is_postgres_cdc_connection(connection: &ConnectionConfig) -> bool {
     matches!(
         &connection.source,
         SourceConfig::Postgres(pg) if pg.cdc.unwrap_or(true)
+    )
+}
+
+fn uses_cdc_batch_load_queue(connection: &ConnectionConfig) -> bool {
+    matches!(
+        &connection.destination,
+        crate::config::DestinationConfig::BigQuery(bq)
+            if bq.batch_load_bucket.is_some() && bq.emulator_http.is_none()
     )
 }
 
@@ -1151,6 +1171,16 @@ async fn progress(
     );
     let cdc =
         ConnectionCdcSnapshot::from_cached(cached_postgres_cdc_slot_state(&state, config).as_ref());
+    let batch_load_queue = if uses_cdc_batch_load_queue(config) {
+        Some(
+            state
+                .state_store
+                .load_cdc_batch_load_queue_summary(&connection_id)
+                .await?,
+        )
+    } else {
+        None
+    };
 
     Ok(Json(ProgressResponse {
         connection_id,
@@ -1158,6 +1188,7 @@ async fn progress(
         current_run,
         runtime,
         cdc,
+        batch_load_queue,
         tables,
     }))
 }

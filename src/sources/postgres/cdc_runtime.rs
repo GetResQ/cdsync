@@ -649,7 +649,8 @@ impl PostgresSource {
                                         force_flush: true,
                                     },
                                 );
-                                for advance in drain_one_cdc_apply(
+                                for advance in drain_one_cdc_work(
+                                    &mut inflight_dispatch,
                                     &mut inflight_apply,
                                     &mut watermark_tracker,
                                     &mut active_table_applies,
@@ -1067,7 +1068,8 @@ impl PostgresSource {
                     .await?;
                 }
             }
-            for advance in drain_one_cdc_apply(
+            for advance in drain_one_cdc_work(
+                &mut inflight_dispatch,
                 &mut inflight_apply,
                 &mut watermark_tracker,
                 &mut active_table_applies,

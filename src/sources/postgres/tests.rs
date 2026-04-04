@@ -568,6 +568,42 @@ fn relation_change_skips_destination_ensure_when_schema_is_unchanged() {
     );
 }
 
+#[tokio::test]
+async fn drain_one_cdc_work_advances_immediate_dispatch_without_completion_future() {
+    let mut inflight_dispatch: FuturesUnordered<CdcDispatchFuture> = FuturesUnordered::new();
+    let mut inflight_apply: FuturesUnordered<CdcApplyFuture> = FuturesUnordered::new();
+    let mut watermark_tracker = CdcWatermarkTracker::default();
+    let mut active_table_applies = HashSet::new();
+    let table_id = TableId::new(42);
+    active_table_applies.insert(table_id);
+    let commit_lsn = etl::types::PgLsn::from(1234_u64);
+
+    watermark_tracker.register_commit(0, commit_lsn, HashMap::new(), 0, 1);
+    inflight_dispatch.push(Box::pin(async move {
+        Ok(CdcDispatchResult::Immediate(CdcApplyFragmentAck {
+            sequences: vec![0],
+            released_table: Some(table_id),
+        }))
+    }));
+
+    let advances = timeout(
+        Duration::from_secs(1),
+        super::drain_one_cdc_work(
+            &mut inflight_dispatch,
+            &mut inflight_apply,
+            &mut watermark_tracker,
+            &mut active_table_applies,
+        ),
+    )
+    .await
+    .expect("drain_one_cdc_work timed out")
+    .expect("drain_one_cdc_work failed");
+
+    assert_eq!(advances.len(), 1);
+    assert_eq!(advances[0].commit_lsn, commit_lsn);
+    assert!(active_table_applies.is_empty());
+}
+
 #[test]
 fn snapshot_progress_logging_uses_ten_batch_interval() {
     assert!(!should_log_snapshot_progress(0));

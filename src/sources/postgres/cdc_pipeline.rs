@@ -396,6 +396,40 @@ pub(super) async fn drain_one_cdc_apply(
     handle_cdc_apply_result(result, watermark_tracker, active_table_applies)
 }
 
+pub(super) async fn drain_one_cdc_work(
+    inflight_dispatch: &mut FuturesUnordered<CdcDispatchFuture>,
+    inflight_apply: &mut FuturesUnordered<CdcApplyFuture>,
+    watermark_tracker: &mut CdcWatermarkTracker,
+    active_table_applies: &mut HashSet<TableId>,
+) -> Result<Vec<CdcWatermarkAdvance>> {
+    if inflight_dispatch.is_empty() {
+        return drain_one_cdc_apply(inflight_apply, watermark_tracker, active_table_applies).await;
+    }
+    if inflight_apply.is_empty() {
+        let result = inflight_dispatch.next().await;
+        return handle_cdc_dispatch_result(
+            result,
+            watermark_tracker,
+            inflight_apply,
+            active_table_applies,
+        );
+    }
+
+    tokio::select! {
+        result = inflight_dispatch.next() => {
+            handle_cdc_dispatch_result(
+                result,
+                watermark_tracker,
+                inflight_apply,
+                active_table_applies,
+            )
+        }
+        result = inflight_apply.next() => {
+            handle_cdc_apply_result(result, watermark_tracker, active_table_applies)
+        }
+    }
+}
+
 pub(super) fn pending_cdc_commit_count(
     pending_table_batches: &HashMap<TableId, PendingTableApplyBatch>,
 ) -> usize {

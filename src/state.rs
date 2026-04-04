@@ -75,6 +75,21 @@ pub struct CdcBatchLoadJobRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CdcBatchLoadQueueSummary {
+    pub total_jobs: i64,
+    pub pending_jobs: i64,
+    pub running_jobs: i64,
+    pub succeeded_jobs: i64,
+    pub failed_jobs: i64,
+    pub oldest_pending_age_seconds: Option<i64>,
+    pub oldest_running_age_seconds: Option<i64>,
+    pub first_inflight_sequence: Option<u64>,
+    pub first_inflight_table: Option<String>,
+    pub latest_failed_error: Option<String>,
+    pub latest_failed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConnectionState {
     #[serde(default)]
     pub postgres: HashMap<String, TableCheckpoint>,
@@ -605,6 +620,89 @@ impl SyncStateStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn load_cdc_batch_load_queue_summary(
+        &self,
+        connection_id: &str,
+    ) -> anyhow::Result<CdcBatchLoadQueueSummary> {
+        let now = now_millis();
+        let aggregate = sqlx::query(&format!(
+            r#"
+            select
+                count(*)::bigint as total_jobs,
+                count(*) filter (where status = 'pending')::bigint as pending_jobs,
+                count(*) filter (where status = 'running')::bigint as running_jobs,
+                count(*) filter (where status = 'succeeded')::bigint as succeeded_jobs,
+                count(*) filter (where status = 'failed')::bigint as failed_jobs,
+                min(created_at) filter (where status = 'pending') as oldest_pending_ms,
+                min(updated_at) filter (where status = 'running') as oldest_running_ms
+            from {}
+            where connection_id = $1
+            "#,
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let inflight = sqlx::query(&format!(
+            r#"
+            select first_sequence, table_key
+            from {}
+            where connection_id = $1
+              and status in ('pending', 'running')
+            order by first_sequence asc, created_at asc
+            limit 1
+            "#,
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let failed = sqlx::query(&format!(
+            r#"
+            select last_error, updated_at
+            from {}
+            where connection_id = $1
+              and status = 'failed'
+            order by updated_at desc
+            limit 1
+            "#,
+            self.table("cdc_batch_load_jobs")
+        ))
+        .bind(connection_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let oldest_pending_ms: Option<i64> = aggregate.try_get("oldest_pending_ms")?;
+        let oldest_running_ms: Option<i64> = aggregate.try_get("oldest_running_ms")?;
+
+        Ok(CdcBatchLoadQueueSummary {
+            total_jobs: aggregate.try_get::<i64, _>("total_jobs")?,
+            pending_jobs: aggregate.try_get::<i64, _>("pending_jobs")?,
+            running_jobs: aggregate.try_get::<i64, _>("running_jobs")?,
+            succeeded_jobs: aggregate.try_get::<i64, _>("succeeded_jobs")?,
+            failed_jobs: aggregate.try_get::<i64, _>("failed_jobs")?,
+            oldest_pending_age_seconds: oldest_pending_ms.map(|ts| ((now - ts).max(0)) / 1000),
+            oldest_running_age_seconds: oldest_running_ms.map(|ts| ((now - ts).max(0)) / 1000),
+            first_inflight_sequence: inflight
+                .as_ref()
+                .and_then(|row| row.try_get::<i64, _>("first_sequence").ok())
+                .map(|value| value as u64),
+            first_inflight_table: inflight
+                .as_ref()
+                .and_then(|row| row.try_get::<String, _>("table_key").ok()),
+            latest_failed_error: failed
+                .as_ref()
+                .and_then(|row| row.try_get::<Option<String>, _>("last_error").ok())
+                .flatten(),
+            latest_failed_at: failed
+                .as_ref()
+                .and_then(|row| row.try_get::<i64, _>("updated_at").ok())
+                .and_then(datetime_from_millis),
+        })
     }
 
     pub async fn acquire_connection_lock(

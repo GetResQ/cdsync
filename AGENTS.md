@@ -10,3 +10,7 @@
 - Never commit broken tests
 - Do not build Linux release artifacts locally. Use GitHub Actions/release automation for Linux binaries unless the user explicitly asks otherwise.
 - CDSync ECS deploys in staging currently use a drain-then-start rollout shape. Expect a brief zero-target window during deploys, typically about 1-3 minutes, before the replacement task reaches `RUNNING` and the admin target becomes healthy. Do not treat that alone as a failure unless the service stays at `runningCount=0`/no healthy target beyond the normal startup window or begins task-restart churn.
+- After each CDSync deploy, wait about 3 minutes and then verify actual system behavior, not just ECS stabilization:
+  - check the admin API/progress data for real forward movement
+  - inspect Datadog (`pup`) logs for the new task
+  - report both the health state and whether CDC data is actually progressing
