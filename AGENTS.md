@@ -8,3 +8,4 @@
 - Mock external deps in tests (Twilio, OpenAI, etc.)
 - #![allow(dead_code)] is not allowed. No compiler warnings, no clippy warnings.
 - Never commit broken tests
+- Do not build Linux release artifacts locally. Use GitHub Actions/release automation for Linux binaries unless the user explicitly asks otherwise.
