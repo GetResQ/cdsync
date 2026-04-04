@@ -363,6 +363,7 @@ struct ProgressResponse {
     state: Option<ConnectionState>,
     current_run: Option<RunSummary>,
     runtime: ConnectionRuntime,
+    cdc: ConnectionCdcSnapshot,
     tables: Vec<TableProgress>,
 }
 
@@ -538,9 +539,10 @@ enum PostgresCdcRuntimeState {
 }
 
 #[derive(Debug, Clone)]
-enum CachedPostgresCdcSlotState {
-    Snapshot(Option<PostgresCdcSlotSnapshot>),
-    Unknown,
+struct CachedPostgresCdcSlotState {
+    sampler_status: &'static str,
+    sampled_at: Option<DateTime<Utc>>,
+    snapshot: Option<PostgresCdcSlotSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -555,7 +557,59 @@ struct PostgresCdcSlotSnapshot {
     continuity_lost: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ConnectionCdcSnapshot {
+    sampler_status: &'static str,
+    sampled_at: Option<DateTime<Utc>>,
+    slot_name: Option<String>,
+    slot_active: Option<bool>,
+    current_wal_lsn: Option<String>,
+    restart_lsn: Option<String>,
+    confirmed_flush_lsn: Option<String>,
+    wal_bytes_retained_by_slot: Option<i64>,
+    wal_bytes_behind_confirmed: Option<i64>,
+}
+
 type CdcSlotSamplerCache = Arc<HashMap<String, watch::Sender<CachedPostgresCdcSlotState>>>;
+
+impl CachedPostgresCdcSlotState {
+    fn unknown() -> Self {
+        Self {
+            sampler_status: "unknown",
+            sampled_at: Some(Utc::now()),
+            snapshot: None,
+        }
+    }
+
+    fn sampled(snapshot: Option<PostgresCdcSlotSnapshot>) -> Self {
+        Self {
+            sampler_status: "ok",
+            sampled_at: Some(Utc::now()),
+            snapshot,
+        }
+    }
+}
+
+impl ConnectionCdcSnapshot {
+    fn from_cached(state: Option<&CachedPostgresCdcSlotState>) -> Self {
+        let snapshot = state.and_then(|state| state.snapshot.as_ref());
+        Self {
+            sampler_status: state
+                .map(|state| state.sampler_status)
+                .unwrap_or("disabled"),
+            sampled_at: state.and_then(|state| state.sampled_at),
+            slot_name: snapshot.and_then(|snapshot| snapshot.slot_name.clone()),
+            slot_active: snapshot.map(|snapshot| snapshot.active),
+            current_wal_lsn: snapshot.and_then(|snapshot| snapshot.current_wal_lsn.clone()),
+            restart_lsn: snapshot.and_then(|snapshot| snapshot.restart_lsn.clone()),
+            confirmed_flush_lsn: snapshot.and_then(|snapshot| snapshot.confirmed_flush_lsn.clone()),
+            wal_bytes_retained_by_slot: snapshot
+                .and_then(|snapshot| snapshot.wal_bytes_retained_by_slot),
+            wal_bytes_behind_confirmed: snapshot
+                .and_then(|snapshot| snapshot.wal_bytes_behind_confirmed),
+        }
+    }
+}
 
 pub struct AdminApiHandle {
     thread: thread::JoinHandle<anyhow::Result<()>>,
@@ -658,6 +712,8 @@ struct ConnectionThroughputData {
 
 #[derive(Serialize)]
 struct ConnectionCdcData {
+    sampler_status: &'static str,
+    sampled_at: Option<DateTime<Utc>>,
     slot_name: Option<String>,
     slot_active: Option<bool>,
     current_wal_lsn: Option<String>,
@@ -701,7 +757,11 @@ fn build_cdc_slot_sampler_cache(cfg: &Config) -> CdcSlotSamplerCache {
     let mut cache = HashMap::new();
     for connection in &cfg.connections {
         if is_postgres_cdc_connection(connection) {
-            let (tx, _rx) = watch::channel(CachedPostgresCdcSlotState::Unknown);
+            let (tx, _rx) = watch::channel(CachedPostgresCdcSlotState {
+                sampler_status: "initializing",
+                sampled_at: None,
+                snapshot: None,
+            });
             cache.insert(connection.id.clone(), tx);
         }
     }
@@ -720,13 +780,13 @@ async fn sample_cached_postgres_cdc_slot_state(
                 error = %err,
                 "failed to load state for postgres CDC slot sampler"
             );
-            return CachedPostgresCdcSlotState::Unknown;
+            return CachedPostgresCdcSlotState::unknown();
         }
     };
     let connection_state = sync_state.connections.get(&connection.id);
     match load_postgres_cdc_slot_snapshot(connection, connection_state).await {
-        Ok(snapshot) => CachedPostgresCdcSlotState::Snapshot(snapshot),
-        Err(()) => CachedPostgresCdcSlotState::Unknown,
+        Ok(snapshot) => CachedPostgresCdcSlotState::sampled(snapshot),
+        Err(()) => CachedPostgresCdcSlotState::unknown(),
     }
 }
 
@@ -786,18 +846,11 @@ fn cached_postgres_cdc_slot_state(
         .cdc_slot_sampler_cache
         .get(&connection.id)
         .map(|sender| sender.borrow().clone())
-        .or(Some(CachedPostgresCdcSlotState::Unknown))
-}
-
-fn cached_postgres_cdc_slot_snapshot(
-    state: &AdminApiState,
-    connection: &ConnectionConfig,
-) -> Result<Option<PostgresCdcSlotSnapshot>, ()> {
-    match cached_postgres_cdc_slot_state(state, connection) {
-        Some(CachedPostgresCdcSlotState::Snapshot(snapshot)) => Ok(snapshot),
-        Some(CachedPostgresCdcSlotState::Unknown) => Err(()),
-        None => Ok(None),
-    }
+        .or(Some(CachedPostgresCdcSlotState {
+            sampler_status: "disabled",
+            sampled_at: None,
+            snapshot: None,
+        }))
 }
 
 fn cached_postgres_cdc_runtime_state(
@@ -805,11 +858,14 @@ fn cached_postgres_cdc_runtime_state(
     connection: &ConnectionConfig,
 ) -> Option<PostgresCdcRuntimeState> {
     match cached_postgres_cdc_slot_state(state, connection) {
-        Some(CachedPostgresCdcSlotState::Snapshot(snapshot)) => {
-            postgres_cdc_runtime_state_from_snapshot(snapshot.as_ref())
+        Some(slot_state) if slot_state.sampler_status == "ok" => {
+            postgres_cdc_runtime_state_from_snapshot(slot_state.snapshot.as_ref())
         }
-        Some(CachedPostgresCdcSlotState::Unknown) => Some(PostgresCdcRuntimeState::Unknown),
+        Some(slot_state) if matches!(slot_state.sampler_status, "unknown" | "initializing") => {
+            Some(PostgresCdcRuntimeState::Unknown)
+        }
         None => None,
+        Some(_) => None,
     }
 }
 
@@ -1083,12 +1139,15 @@ async fn progress(
         runtime.reason_code,
         cdc_runtime_state,
     );
+    let cdc =
+        ConnectionCdcSnapshot::from_cached(cached_postgres_cdc_slot_state(&state, config).as_ref());
 
     Ok(Json(ProgressResponse {
         connection_id,
         state: connection_state,
         current_run,
         runtime,
+        cdc,
         tables,
     }))
 }
@@ -1209,7 +1268,12 @@ async fn build_stream_events(cursor: &mut StreamCursor) -> anyhow::Result<VecDeq
     let connection_state = sync_state.connections.get(&cursor.connection_id).cloned();
     let (current_run, run_tables, live_snapshot) =
         load_current_run_view(&cursor.state, &cursor.connection_id).await?;
-    let cdc_probe = cached_postgres_cdc_slot_snapshot(&cursor.state, connection);
+    let cached_cdc_state = cached_postgres_cdc_slot_state(&cursor.state, connection);
+    let cdc_probe = match cached_cdc_state.as_ref() {
+        Some(slot_state) if slot_state.sampler_status == "ok" => Ok(slot_state.snapshot.clone()),
+        Some(_) => Err(()),
+        None => Ok(None),
+    };
     let cdc_slot_snapshot = match &cdc_probe {
         Ok(snapshot) => snapshot.clone(),
         Err(()) => None,
@@ -1277,6 +1341,11 @@ async fn build_stream_events(cursor: &mut StreamCursor) -> anyhow::Result<VecDeq
         &cursor.connection_id,
         "connection.cdc",
         ConnectionCdcData {
+            sampler_status: cached_cdc_state
+                .as_ref()
+                .map(|state| state.sampler_status)
+                .unwrap_or("disabled"),
+            sampled_at: cached_cdc_state.as_ref().and_then(|state| state.sampled_at),
             slot_name: cdc_slot_snapshot
                 .as_ref()
                 .and_then(|snapshot| snapshot.slot_name.clone()),

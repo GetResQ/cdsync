@@ -105,12 +105,15 @@ impl PostgresSource {
             .await?;
         let stream = EventsStream::wrap(logical_stream, pipeline_id);
         tokio::pin!(stream);
+        let mut connection_updates_rx = replication_client.connection_updates_rx();
 
         let mut pending_events: Vec<Event> = Vec::with_capacity(max_pending_events.min(1024));
         let mut pending_stats: HashMap<TableId, usize> = HashMap::new();
         let mut last_received_lsn = start_lsn;
         let mut last_flushed_lsn = start_lsn;
         let mut last_xlog_activity = Instant::now();
+        let mut last_replication_message = Instant::now();
+        let mut last_heartbeat_log = Instant::now();
         let mut tx_extract_started_at: Option<Instant> = None;
         let mut next_tx_ordinal = 0u64;
         let mut in_tx = false;
@@ -149,6 +152,10 @@ impl PostgresSource {
                             }
                             break;
                         }
+                        continue;
+                    }
+                    changed = connection_updates_rx.changed() => {
+                        handle_cdc_connection_update(changed, &mut connection_updates_rx, slot_name)?;
                         continue;
                     }
                     result = inflight_apply.next(), if !inflight_apply.is_empty() => {
@@ -230,9 +237,43 @@ impl PostgresSource {
                                     continue;
                                 }
                                 if in_tx {
+                                    maybe_log_cdc_wait_timeout(
+                                        slot_name,
+                                        &mut last_heartbeat_log,
+                                        last_replication_message,
+                                        last_xlog_activity,
+                                        last_received_lsn,
+                                        last_flushed_lsn,
+                                        pending_events.len(),
+                                        queued_batches.len(),
+                                        pending_table_batches.len(),
+                                        inflight_apply.len(),
+                                        active_table_applies.len(),
+                                        watermark_tracker.inflight_commits(),
+                                        in_tx,
+                                        follow,
+                                        "open_transaction",
+                                    );
                                     continue;
                                 }
                                 if follow {
+                                    maybe_log_cdc_wait_timeout(
+                                        slot_name,
+                                        &mut last_heartbeat_log,
+                                        last_replication_message,
+                                        last_xlog_activity,
+                                        last_received_lsn,
+                                        last_flushed_lsn,
+                                        pending_events.len(),
+                                        queued_batches.len(),
+                                        pending_table_batches.len(),
+                                        inflight_apply.len(),
+                                        active_table_applies.len(),
+                                        watermark_tracker.inflight_commits(),
+                                        in_tx,
+                                        follow,
+                                        "follow_idle",
+                                    );
                                     continue;
                                 }
                                 break;
@@ -288,6 +329,10 @@ impl PostgresSource {
                         );
                         continue;
                     }
+                    changed = connection_updates_rx.changed() => {
+                        handle_cdc_connection_update(changed, &mut connection_updates_rx, slot_name)?;
+                        continue;
+                    }
                     result = timeout(wait_timeout, stream.next()) => match result {
                     Ok(Some(msg)) => msg?,
                     Ok(None) => break,
@@ -320,15 +365,61 @@ impl PostgresSource {
                             continue;
                         }
                         if in_tx {
+                            maybe_log_cdc_wait_timeout(
+                                slot_name,
+                                &mut last_heartbeat_log,
+                                last_replication_message,
+                                last_xlog_activity,
+                                last_received_lsn,
+                                last_flushed_lsn,
+                                pending_events.len(),
+                                queued_batches.len(),
+                                pending_table_batches.len(),
+                                inflight_apply.len(),
+                                active_table_applies.len(),
+                                watermark_tracker.inflight_commits(),
+                                in_tx,
+                                follow,
+                                "open_transaction",
+                            );
                             continue;
                         }
                         if follow {
+                            maybe_log_cdc_wait_timeout(
+                                slot_name,
+                                &mut last_heartbeat_log,
+                                last_replication_message,
+                                last_xlog_activity,
+                                last_received_lsn,
+                                last_flushed_lsn,
+                                pending_events.len(),
+                                queued_batches.len(),
+                                pending_table_batches.len(),
+                                inflight_apply.len(),
+                                active_table_applies.len(),
+                                watermark_tracker.inflight_commits(),
+                                in_tx,
+                                follow,
+                                "follow_idle",
+                            );
                             continue;
                         }
                         break;
                     }
                 }}
             };
+
+            let replication_idle_for = last_replication_message.elapsed();
+            last_replication_message = Instant::now();
+            if replication_idle_for >= Duration::from_secs(30) {
+                info!(
+                    slot_name = slot_name,
+                    idle_secs = replication_idle_for.as_secs(),
+                    last_received_lsn = %last_received_lsn,
+                    last_flushed_lsn = %last_flushed_lsn,
+                    "received replication message after idle period"
+                );
+            }
 
             match message {
                 ReplicationMessage::PrimaryKeepAlive(keepalive) => {
@@ -337,15 +428,24 @@ impl PostgresSource {
                         last_received_lsn = wal_end;
                     }
                     if keepalive.reply() == 1 {
-                        stream
-                            .as_mut()
-                            .send_status_update(
+                        info!(
+                            slot_name = slot_name,
+                            wal_end = %wal_end,
+                            last_received_lsn = %last_received_lsn,
+                            last_flushed_lsn = %last_flushed_lsn,
+                            "postgres requested logical replication keepalive reply"
+                        );
+                        await_cdc_timeout(
+                            format!("sending CDC keepalive status update for slot {}", slot_name),
+                            CDC_STATUS_UPDATE_TIMEOUT,
+                            stream.as_mut().send_status_update(
                                 last_received_lsn,
                                 last_flushed_lsn,
                                 true,
                                 StatusUpdateType::KeepAlive,
-                            )
-                            .await?;
+                            ),
+                        )
+                        .await?;
                     }
                 }
                 ReplicationMessage::XLogData(xlog) => {
@@ -686,6 +786,25 @@ impl PostgresSource {
                 _ => {}
             }
 
+            if last_heartbeat_log.elapsed() >= Duration::from_secs(30) {
+                info!(
+                    slot_name = slot_name,
+                    last_received_lsn = %last_received_lsn,
+                    last_flushed_lsn = %last_flushed_lsn,
+                    pending_events = pending_events.len(),
+                    queued_batches = queued_batches.len(),
+                    pending_table_batches = pending_table_batches.len(),
+                    inflight_apply = inflight_apply.len(),
+                    active_table_applies = active_table_applies.len(),
+                    inflight_commits = watermark_tracker.inflight_commits(),
+                    in_tx,
+                    expected_commit_lsn = ?expected_commit_lsn,
+                    last_xlog_activity_secs = last_xlog_activity.elapsed().as_secs(),
+                    "cdc loop heartbeat"
+                );
+                last_heartbeat_log = Instant::now();
+            }
+
             while let Some(Some(result)) = inflight_apply.next().now_or_never() {
                 for advance in handle_cdc_apply_result(
                     Some(result),
@@ -1003,4 +1122,84 @@ pub(super) fn cdc_should_stop_after_idle(
         && state.pending_table_batches_empty
         && state.inflight_apply_empty
         && last_xlog_activity.elapsed() >= idle_timeout
+}
+
+fn handle_cdc_connection_update(
+    changed: Result<(), tokio::sync::watch::error::RecvError>,
+    connection_updates_rx: &mut tokio::sync::watch::Receiver<
+        etl::replication::client::PostgresConnectionUpdate,
+    >,
+    slot_name: &str,
+) -> Result<()> {
+    if changed.is_err() {
+        anyhow::bail!(
+            "postgres replication connection updates ended unexpectedly for slot {}",
+            slot_name
+        );
+    }
+
+    let update = connection_updates_rx.borrow_and_update().clone();
+    match update {
+        etl::replication::client::PostgresConnectionUpdate::Running => {
+            info!(
+                slot_name = slot_name,
+                "postgres replication connection running"
+            );
+            Ok(())
+        }
+        etl::replication::client::PostgresConnectionUpdate::Terminated => {
+            anyhow::bail!(
+                "postgres replication connection terminated for slot {}",
+                slot_name
+            )
+        }
+        etl::replication::client::PostgresConnectionUpdate::Errored { error } => {
+            anyhow::bail!(
+                "postgres replication connection errored for slot {}: {}",
+                slot_name,
+                error
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_log_cdc_wait_timeout(
+    slot_name: &str,
+    last_heartbeat_log: &mut Instant,
+    last_replication_message: Instant,
+    last_xlog_activity: Instant,
+    last_received_lsn: etl::types::PgLsn,
+    last_flushed_lsn: etl::types::PgLsn,
+    pending_events: usize,
+    queued_batches: usize,
+    pending_table_batches: usize,
+    inflight_apply: usize,
+    active_table_applies: usize,
+    inflight_commits: usize,
+    in_tx: bool,
+    follow: bool,
+    reason: &'static str,
+) {
+    if last_heartbeat_log.elapsed() < Duration::from_secs(30) {
+        return;
+    }
+    info!(
+        slot_name = slot_name,
+        last_received_lsn = %last_received_lsn,
+        last_flushed_lsn = %last_flushed_lsn,
+        pending_events,
+        queued_batches,
+        pending_table_batches,
+        inflight_apply,
+        active_table_applies,
+        inflight_commits,
+        in_tx,
+        follow,
+        last_replication_message_secs = last_replication_message.elapsed().as_secs(),
+        last_xlog_activity_secs = last_xlog_activity.elapsed().as_secs(),
+        reason,
+        "waiting for replication message"
+    );
+    *last_heartbeat_log = Instant::now();
 }

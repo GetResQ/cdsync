@@ -235,7 +235,7 @@ fn test_cdc_slot_sampler_cache(cfg: &Config) -> CdcSlotSamplerCache {
         if !super::is_postgres_cdc_connection(connection) {
             continue;
         }
-        let (tx, _rx) = watch::channel(CachedPostgresCdcSlotState::Snapshot(Some(
+        let (tx, _rx) = watch::channel(CachedPostgresCdcSlotState::sampled(Some(
             PostgresCdcSlotSnapshot {
                 slot_name: Some("slot_app".to_string()),
                 active: true,
@@ -361,7 +361,7 @@ async fn spawn_test_server(
 
 #[tokio::test]
 async fn publish_cached_postgres_cdc_slot_state_overwrites_snapshot_with_unknown() {
-    let (tx, _rx) = watch::channel(CachedPostgresCdcSlotState::Snapshot(Some(
+    let (tx, _rx) = watch::channel(CachedPostgresCdcSlotState::sampled(Some(
         PostgresCdcSlotSnapshot {
             slot_name: Some("slot_app".to_string()),
             active: true,
@@ -374,9 +374,12 @@ async fn publish_cached_postgres_cdc_slot_state_overwrites_snapshot_with_unknown
         },
     )));
 
-    super::publish_cached_postgres_cdc_slot_state(&tx, CachedPostgresCdcSlotState::Unknown);
+    super::publish_cached_postgres_cdc_slot_state(&tx, CachedPostgresCdcSlotState::unknown());
 
-    assert!(matches!(&*tx.borrow(), CachedPostgresCdcSlotState::Unknown));
+    let updated = tx.borrow().clone();
+    assert_eq!(updated.sampler_status, "unknown");
+    assert!(updated.snapshot.is_none());
+    assert!(updated.sampled_at.is_some());
 }
 
 #[tokio::test]
@@ -754,6 +757,10 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
     let progress_json = progress.json::<serde_json::Value>().await?;
     assert_eq!(progress_json["current_run"]["run_id"], "run-1");
     assert_eq!(progress_json["runtime"]["phase"], "healthy");
+    assert_eq!(progress_json["cdc"]["sampler_status"], "ok");
+    assert_eq!(progress_json["cdc"]["slot_active"], true);
+    assert_eq!(progress_json["cdc"]["confirmed_flush_lsn"], "0/16B6C50");
+    assert!(progress_json["cdc"]["sampled_at"].is_string());
     assert_eq!(progress_json["tables"][0]["table_name"], "public.accounts");
     assert_eq!(
         progress_json["tables"][0]["checkpoint"]["last_primary_key"],

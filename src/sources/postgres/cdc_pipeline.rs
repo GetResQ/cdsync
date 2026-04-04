@@ -1,6 +1,6 @@
 use super::*;
 
-const CDC_STATUS_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const CDC_STATUS_UPDATE_TIMEOUT: Duration = Duration::from_secs(30);
 const CDC_STATE_SAVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(super) struct CommittedCdcBatch {
@@ -187,7 +187,21 @@ pub(super) fn dispatch_cdc_batches(
     config: CdcDispatchConfig,
 ) {
     while let Some(batch) = queued_batches.pop_front() {
+        let table_count = batch.table_batches.len();
+        let event_count: usize = batch
+            .table_batches
+            .iter()
+            .map(|table_batch| table_batch.events.len())
+            .sum();
         let fragment_count = batch.table_batches.len().max(1);
+        info!(
+            sequence = batch.sequence,
+            commit_lsn = %batch.commit_lsn,
+            table_count,
+            event_count,
+            fragment_count,
+            "cdc commit queued for dispatch"
+        );
         watermark_tracker.register_commit(
             batch.sequence,
             batch.commit_lsn,
@@ -256,7 +270,17 @@ pub(super) fn dispatch_cdc_batches(
         let apply_dest = dest.clone();
         let sequences = pending.sequences;
         let events = pending.events;
+        let sequence_count = sequences.len();
+        let event_count = events.len();
         coordination.active_table_applies.insert(table_id);
+        info!(
+            table_id = table_id.into_inner(),
+            sequence_count,
+            event_count,
+            inflight_apply = inflight_apply.len(),
+            force_flush = config.force_flush,
+            "cdc table batch dispatched"
+        );
         inflight_apply.push(Box::pin(async move {
             let _guard = table_lock.lock().await;
             apply_dest
@@ -269,6 +293,10 @@ pub(super) fn dispatch_cdc_batches(
                         err
                     )
                 })?;
+            info!(
+                table_id = table_id.into_inner(),
+                sequence_count, event_count, "cdc table batch apply completed"
+            );
             Ok(CdcApplyFragmentAck {
                 sequences,
                 released_table: Some(table_id),
@@ -286,6 +314,11 @@ pub(super) fn handle_cdc_apply_result(
         return Ok(Vec::new());
     };
     let ack = result?;
+    info!(
+        sequence_count = ack.sequences.len(),
+        released_table = ?ack.released_table.map(|table_id| table_id.into_inner()),
+        "cdc apply result received"
+    );
     if let Some(table_id) = ack.released_table {
         active_table_applies.remove(&table_id);
     }
@@ -341,6 +374,13 @@ pub(super) async fn apply_cdc_watermark_advance(
     }
 
     *last_flushed_lsn = advance.commit_lsn;
+    info!(
+        commit_lsn = %advance.commit_lsn,
+        stats_tables = advance.stats.len(),
+        extract_ms = advance.extract_ms,
+        last_received_lsn = %last_received_lsn,
+        "advancing cdc watermark"
+    );
     await_cdc_timeout(
         format!("sending CDC status update for {}", advance.commit_lsn),
         CDC_STATUS_UPDATE_TIMEOUT,

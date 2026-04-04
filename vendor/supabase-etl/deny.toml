@@ -1,0 +1,5 @@
+[advisories]
+version = 2
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "Disabling because it is not a real vulnerability. The crate paste is just unmaintained." },
+]

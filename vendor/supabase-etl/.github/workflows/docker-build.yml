@@ -1,0 +1,223 @@
+name: Docker Build
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "Docker image (e.g. public.ecr.aws/supabase/<repo>)"
+        type: string
+        required: true
+      checkout_ref:
+        description: "Git ref (branch, SHA, or tag) to check out"
+        type: string
+        required: false
+      file:
+        description: "Path to Dockerfile relative to the repository root"
+        type: string
+        default: "Dockerfile"
+      context:
+        description: "Docker build context"
+        type: string
+        default: "."
+      push:
+        description: "Push image to registry"
+        type: boolean
+        default: false
+      tag_with_version:
+        description: "Also tag the image with version"
+        type: boolean
+        default: false
+      version:
+        description: "Version to tag when tag_with_version=true"
+        type: string
+        required: false
+      experimental:
+        description: "Build experimental image (main branch excluded)"
+        type: boolean
+        default: false
+      build_args:
+        description: "Docker build arguments (newline-separated KEY=VALUE pairs)"
+        type: string
+        default: ""
+    secrets:
+      PROD_AWS_ROLE:
+        description: "AWS IAM role ARN for ECR push access"
+        required: true
+
+permissions:
+  contents: read
+  actions: write
+  id-token: write
+
+jobs:
+  # Build each platform natively on its own runner
+  build-platform:
+    name: Build ${{ matrix.platform }} Image
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: blacksmith-4vcpu-ubuntu-2404
+            arch: amd64
+          - platform: linux/arm64
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            arch: arm64
+    outputs:
+      digest-amd64: ${{ steps.export-digest.outputs.digest-amd64 }}
+      digest-arm64: ${{ steps.export-digest.outputs.digest-arm64 }}
+      image-name: ${{ steps.extract-name.outputs.name }}
+    steps:
+      - name: Extract Image Name
+        id: extract-name
+        run: |
+          IMAGE="${{ inputs.image }}"
+          NAME="${IMAGE##*/}"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout (specific ref)
+        if: inputs.checkout_ref != ''
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ inputs.checkout_ref }}
+
+      - name: Checkout (default)
+        if: inputs.checkout_ref == ''
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Docker Buildx
+        uses: useblacksmith/setup-docker-builder@ef12d5b165b596e3aa44ea8198d8fde563eab402 # v1.4.0
+
+      - name: Configure AWS credentials
+        if: inputs.push == true
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.PROD_AWS_ROLE }}
+          aws-region: us-east-1
+
+      - name: Log in to Amazon ECR Public
+        if: inputs.push == true
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: public.ecr.aws
+
+      - name: Build and Push Single-Platform Image
+        id: build
+        uses: useblacksmith/build-push-action@30c71162f16ea2c27c3e21523255d209b8b538c1 # v2
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.file }}
+          push: ${{ inputs.push }}
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          outputs: type=image,name=${{ inputs.image }},push-by-digest=true,name-canonical=true
+          build-args: ${{ inputs.build_args }}
+
+      - name: Export Digest
+        id: export-digest
+        if: inputs.push == true
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          echo "$digest" > "/tmp/digests/${{ matrix.arch }}.txt"
+          echo "digest-${{ matrix.arch }}=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Digest
+        if: inputs.push == true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digests-${{ steps.extract-name.outputs.name }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Create multi-arch manifest combining both platforms
+  create-manifest:
+    name: Create Multi-Arch Manifest
+    needs: build-platform
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: inputs.push == true
+    steps:
+      - name: Extract Image Name
+        id: extract-name
+        run: |
+          IMAGE="${{ inputs.image }}"
+          NAME="${IMAGE##*/}"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Download Digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ steps.extract-name.outputs.name }}-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: useblacksmith/setup-docker-builder@ef12d5b165b596e3aa44ea8198d8fde563eab402 # v1.4.0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.PROD_AWS_ROLE }}
+          aws-region: us-east-1
+
+      - name: Log in to Amazon ECR Public
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: public.ecr.aws
+
+      - name: Checkout (specific ref)
+        if: inputs.checkout_ref != ''
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ inputs.checkout_ref }}
+
+      - name: Checkout (default)
+        if: inputs.checkout_ref == ''
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Create and Push Multi-Arch Manifest
+        run: |
+          IMAGE="${{ inputs.image }}"
+          FULL_SHA=$(git rev-parse HEAD)
+
+          # Prepare digest list for imagetools
+          DIGEST_LIST=""
+          for digest_file in /tmp/digests/*.txt; do
+            digest=$(cat "$digest_file")
+            DIGEST_LIST="${DIGEST_LIST} ${IMAGE}@${digest}"
+          done
+
+          if [ "${{ inputs.experimental }}" = "true" ]; then
+            # Experimental mode: only tag with commithash-experimental
+            docker buildx imagetools create -t "${IMAGE}:${FULL_SHA}-experimental" ${DIGEST_LIST}
+          else
+            # Standard mode: tag with latest and SHA
+            docker buildx imagetools create -t "${IMAGE}:latest" ${DIGEST_LIST}
+            docker buildx imagetools create -t "${IMAGE}:${FULL_SHA}" ${DIGEST_LIST}
+
+            # Create manifest for version if needed
+            if [ "${{ inputs.tag_with_version }}" = "true" ] && [ -n "${{ inputs.version }}" ]; then
+              docker buildx imagetools create -t "${IMAGE}:v${{ inputs.version }}" ${DIGEST_LIST}
+            fi
+          fi
+
+      - name: Output Image Information
+        run: |
+          IMAGE="${{ inputs.image }}"
+          NAME="${IMAGE##*/}"
+          FULL_SHA=$(git rev-parse HEAD)
+          if [ "${{ inputs.experimental }}" = "true" ]; then
+            TAGS="${FULL_SHA}-experimental"
+            MODE="experimental"
+          else
+            TAGS="latest, ${FULL_SHA}"
+            MODE="standard"
+            if [ "${{ inputs.tag_with_version }}" = "true" ] && [ -n "${{ inputs.version }}" ]; then
+              TAGS="${TAGS}, v${{ inputs.version }}"
+            fi
+          fi
+          echo "✅ Successfully built and pushed ${NAME} multi-arch image (${MODE} mode)"
+          echo "🏷️ Tags: ${TAGS}"
+          echo "🏗️ Platforms: linux/amd64, linux/arm64"
+          echo "🔗 View at: https://gallery.ecr.aws/supabase/${NAME}"
