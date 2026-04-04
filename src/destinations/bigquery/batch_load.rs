@@ -238,7 +238,7 @@ const PARQUET_FILE_EXTENSION: &str = "parquet";
 const PARQUET_CONTENT_TYPE: &str = "application/vnd.apache.parquet";
 const BATCH_LOAD_PARQUET_BLOCKING_ROWS: usize = 1024;
 const BATCH_LOAD_JOB_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(30);
-const BATCH_LOAD_JOB_HARD_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 2);
+pub(crate) const BATCH_LOAD_JOB_HARD_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 2);
 
 async fn parquet_payload(frame: &DataFrame, schema: &TableSchema) -> Result<Vec<u8>> {
     if frame.height() < BATCH_LOAD_PARQUET_BLOCKING_ROWS {

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task;
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct EtlBigQueryDestination {
@@ -175,7 +175,22 @@ impl EtlBigQueryDestination {
         if row_count == 0 {
             return Ok(());
         }
+        let ensure_started_at = Instant::now();
+        info!(
+            table = %info.source_name,
+            destination_table = %info.dest_name,
+            rows = row_count,
+            mode = ?mode,
+            "ensuring destination table before CDC write"
+        );
         self.ensure_table(info).await?;
+        info!(
+            table = %info.source_name,
+            destination_table = %info.dest_name,
+            rows = row_count,
+            ensure_ms = ensure_started_at.elapsed().as_millis() as u64,
+            "destination table ensured before CDC write"
+        );
         let frame = build_cdc_frame(info.clone(), rows, synced_at, deleted_at_override).await?;
         let load_start = Instant::now();
         self.inner

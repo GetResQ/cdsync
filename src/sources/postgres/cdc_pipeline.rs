@@ -282,7 +282,15 @@ pub(super) fn dispatch_cdc_batches(
             "cdc table batch dispatched"
         );
         inflight_apply.push(Box::pin(async move {
+            info!(
+                table_id = table_id.into_inner(),
+                sequence_count, event_count, "waiting to acquire cdc table apply lock"
+            );
             let _guard = table_lock.lock().await;
+            info!(
+                table_id = table_id.into_inner(),
+                sequence_count, event_count, "acquired cdc table apply lock"
+            );
             apply_dest
                 .write_table_events(table_id, events)
                 .await

@@ -16,6 +16,7 @@ use reqwest::Client;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::time::{Duration, Instant, sleep, timeout};
@@ -41,6 +42,44 @@ impl AdminStateBackend for FakeStateBackend {
             sleep(delay).await;
         }
         Ok(self.state.clone())
+    }
+
+    async fn load_connection_state(
+        &self,
+        connection_id: &str,
+    ) -> anyhow::Result<Option<ConnectionState>> {
+        if let Some(delay) = self.load_delay {
+            sleep(delay).await;
+        }
+        Ok(self.state.connections.get(connection_id).cloned())
+    }
+}
+
+#[derive(Clone)]
+struct CountingStateBackend {
+    state: SyncState,
+    load_state_calls: Arc<AtomicUsize>,
+    load_connection_state_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl AdminStateBackend for CountingStateBackend {
+    async fn ping(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn load_state(&self) -> anyhow::Result<SyncState> {
+        self.load_state_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.state.clone())
+    }
+
+    async fn load_connection_state(
+        &self,
+        connection_id: &str,
+    ) -> anyhow::Result<Option<ConnectionState>> {
+        self.load_connection_state_calls
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(self.state.connections.get(connection_id).cloned())
     }
 }
 
@@ -380,6 +419,29 @@ async fn publish_cached_postgres_cdc_slot_state_overwrites_snapshot_with_unknown
     assert_eq!(updated.sampler_status, "unknown");
     assert!(updated.snapshot.is_none());
     assert!(updated.sampled_at.is_some());
+}
+
+#[tokio::test]
+async fn postgres_cdc_slot_sampler_loads_connection_state_without_full_state_scan() {
+    let mut cfg = test_config();
+    let mut connection = cfg.connections[0].clone();
+    let SourceConfig::Postgres(pg) = &mut connection.source else {
+        unreachable!();
+    };
+    pg.url = "postgres://127.0.0.1:1/postgres".to_string();
+    let load_state_calls = Arc::new(AtomicUsize::new(0));
+    let load_connection_state_calls = Arc::new(AtomicUsize::new(0));
+    let backend: Arc<dyn AdminStateBackend> = Arc::new(CountingStateBackend {
+        state: test_state(),
+        load_state_calls: Arc::clone(&load_state_calls),
+        load_connection_state_calls: Arc::clone(&load_connection_state_calls),
+    });
+    cfg.connections = vec![connection];
+
+    let _sample = super::sample_cached_postgres_cdc_slot_state(&cfg.connections[0], &backend).await;
+
+    assert_eq!(load_state_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(load_connection_state_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

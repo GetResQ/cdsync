@@ -9,7 +9,8 @@ pub(super) struct CdcIdleState {
     pub(super) inflight_apply_empty: bool,
 }
 
-const CDC_RELATION_PENDING_APPLY_TIMEOUT: Duration = Duration::from_secs(300);
+const CDC_RELATION_PENDING_APPLY_TIMEOUT: Duration =
+    crate::destinations::bigquery::BATCH_LOAD_JOB_HARD_TIMEOUT;
 const CDC_RELATION_CHANGE_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl PostgresSource {

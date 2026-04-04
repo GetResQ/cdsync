@@ -108,6 +108,10 @@ struct AdminApiAuthContext;
 trait AdminStateBackend: Send + Sync {
     async fn ping(&self) -> anyhow::Result<()>;
     async fn load_state(&self) -> anyhow::Result<SyncState>;
+    async fn load_connection_state(
+        &self,
+        connection_id: &str,
+    ) -> anyhow::Result<Option<ConnectionState>>;
 }
 
 #[async_trait]
@@ -129,6 +133,13 @@ impl AdminStateBackend for SyncStateStore {
 
     async fn load_state(&self) -> anyhow::Result<SyncState> {
         SyncStateStore::load_state(self).await
+    }
+
+    async fn load_connection_state(
+        &self,
+        connection_id: &str,
+    ) -> anyhow::Result<Option<ConnectionState>> {
+        SyncStateStore::load_connection_state(self, connection_id).await
     }
 }
 
@@ -772,19 +783,18 @@ async fn sample_cached_postgres_cdc_slot_state(
     connection: &ConnectionConfig,
     state_store: &Arc<dyn AdminStateBackend>,
 ) -> CachedPostgresCdcSlotState {
-    let sync_state = match state_store.load_state().await {
-        Ok(sync_state) => sync_state,
+    let connection_state = match state_store.load_connection_state(&connection.id).await {
+        Ok(connection_state) => connection_state,
         Err(err) => {
             warn!(
                 connection = %connection.id,
                 error = %err,
-                "failed to load state for postgres CDC slot sampler"
+                "failed to load connection state for postgres CDC slot sampler"
             );
             return CachedPostgresCdcSlotState::unknown();
         }
     };
-    let connection_state = sync_state.connections.get(&connection.id);
-    match load_postgres_cdc_slot_snapshot(connection, connection_state).await {
+    match load_postgres_cdc_slot_snapshot(connection, connection_state.as_ref()).await {
         Ok(snapshot) => CachedPostgresCdcSlotState::sampled(snapshot),
         Err(()) => CachedPostgresCdcSlotState::unknown(),
     }

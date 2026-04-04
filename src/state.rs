@@ -178,6 +178,33 @@ impl SyncStateStore {
         })
     }
 
+    pub async fn load_connection_state(
+        &self,
+        connection_id: &str,
+    ) -> anyhow::Result<Option<ConnectionState>> {
+        let row = sqlx::query(&format!(
+            "select last_sync_started_at, last_sync_finished_at, last_sync_status, last_error, postgres_cdc_last_lsn, postgres_cdc_slot_name from {} where connection_id = $1",
+            self.table("connection_state")
+        ))
+        .bind(connection_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        Ok(Some(ConnectionState {
+            postgres: HashMap::new(),
+            postgres_cdc: load_cdc_state_from_row(&row)?,
+            salesforce: HashMap::new(),
+            last_sync_started_at: parse_optional_rfc3339(row.try_get("last_sync_started_at")?),
+            last_sync_finished_at: parse_optional_rfc3339(row.try_get("last_sync_finished_at")?),
+            last_sync_status: row.try_get("last_sync_status")?,
+            last_error: row.try_get("last_error")?,
+        }))
+    }
+
     pub async fn ping(&self) -> anyhow::Result<()> {
         let _: i32 = sqlx::query_scalar("select 1").fetch_one(&self.pool).await?;
         Ok(())
@@ -792,6 +819,51 @@ mod tests {
         );
         assert_eq!(
             connection
+                .postgres_cdc
+                .as_ref()
+                .and_then(|cdc| cdc.last_lsn.as_deref()),
+            Some("0/16B6C50")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn state_store_load_connection_state_reads_single_connection_meta() -> anyhow::Result<()>
+    {
+        let Some(config) = test_state_config() else {
+            return Ok(());
+        };
+        SyncStateStore::migrate_with_config(&config).await?;
+        let store = SyncStateStore::open_with_config(&config).await?;
+        let handle = store.handle("app");
+
+        let mut state = ConnectionState {
+            last_sync_status: Some("running".to_string()),
+            ..Default::default()
+        };
+        state.postgres.insert(
+            "public.accounts".to_string(),
+            TableCheckpoint {
+                last_primary_key: Some("42".to_string()),
+                ..Default::default()
+            },
+        );
+        state.postgres_cdc = Some(PostgresCdcState {
+            last_lsn: Some("0/16B6C50".to_string()),
+            slot_name: Some("slot".to_string()),
+        });
+
+        handle.save_connection_state(&state).await?;
+
+        let loaded = store
+            .load_connection_state("app")
+            .await?
+            .context("missing connection")?;
+        assert_eq!(loaded.last_sync_status.as_deref(), Some("running"));
+        assert!(loaded.postgres.is_empty());
+        assert!(loaded.salesforce.is_empty());
+        assert_eq!(
+            loaded
                 .postgres_cdc
                 .as_ref()
                 .and_then(|cdc| cdc.last_lsn.as_deref()),

@@ -35,6 +35,7 @@ use tracing::{error, info, warn};
 use url::Url;
 use uuid::Uuid;
 
+pub(crate) use self::batch_load::BATCH_LOAD_JOB_HARD_TIMEOUT;
 use self::storage_write::StorageWriteTableWriter;
 use self::values::{
     bq_fields_from_schema, bq_ident, dataframe_to_json_rows, default_port, tuple_value_as_datetime,
@@ -369,6 +370,8 @@ impl BigQueryDestination {
         table_id: &str,
         with_partition: bool,
     ) -> Result<()> {
+        let ensure_started_at = std::time::Instant::now();
+        info!(table = table_id, with_partition, "ensuring BigQuery table");
         self.ensure_dataset().await?;
         let schema = with_metadata_schema(schema, &self.metadata);
         let desired_fields = bq_fields_from_schema(&schema.columns);
@@ -466,6 +469,12 @@ impl BigQueryDestination {
                     )
                     .await?;
                 }
+                info!(
+                    table = table_id,
+                    ensure_ms = ensure_started_at.elapsed().as_millis() as u64,
+                    action = "patch-or-noop-existing",
+                    "BigQuery table ensured"
+                );
                 Ok(())
             }
             Err(BqError::Response(err)) if err.code == 404 => {
@@ -495,6 +504,12 @@ impl BigQueryDestination {
                     self.client.table().create(&table),
                 )
                 .await?;
+                info!(
+                    table = table_id,
+                    ensure_ms = ensure_started_at.elapsed().as_millis() as u64,
+                    action = "created",
+                    "BigQuery table ensured"
+                );
                 Ok(())
             }
             Err(err) => Err(err.into()),
@@ -511,6 +526,16 @@ impl BigQueryDestination {
         if frame.height() == 0 {
             return Ok(());
         }
+        info!(
+            table = table_id,
+            rows = frame.height(),
+            batch_load_enabled =
+                self.config.batch_load_bucket.is_some() && self.config.emulator_http.is_none(),
+            storage_write_enabled = self.config.storage_write_enabled.unwrap_or(true)
+                && self.config.emulator_http.is_none(),
+            has_primary_key = primary_key.is_some(),
+            "append_rows entry"
+        );
         if self.dry_run {
             info!("dry-run: insert {} rows into {}", frame.height(), table_id);
             return Ok(());
@@ -699,6 +724,10 @@ impl BigQueryDestination {
             return;
         }
 
+        if let Err(err) = reap_finished_cleanup_task_handles(&self.cleanup_tasks).await {
+            warn!(error = %err, "failed to reap completed BigQuery cleanup tasks");
+        }
+
         let dest = self.clone();
         let handle = tokio::spawn(async move {
             if let Err(err) = dest.drop_table_if_exists(&table).await {
@@ -717,12 +746,36 @@ impl BigQueryDestination {
     }
 }
 
+async fn reap_finished_cleanup_task_handles(
+    cleanup_tasks: &Arc<Mutex<Vec<JoinHandle<()>>>>,
+) -> Result<()> {
+    let finished = {
+        let mut guard = cleanup_tasks.lock().await;
+        let mut finished = Vec::new();
+        let mut idx = 0;
+        while idx < guard.len() {
+            if guard[idx].is_finished() {
+                finished.push(guard.swap_remove(idx));
+            } else {
+                idx += 1;
+            }
+        }
+        finished
+    };
+
+    join_cleanup_task_handles(finished).await
+}
+
 async fn drain_cleanup_task_handles(cleanup_tasks: &Arc<Mutex<Vec<JoinHandle<()>>>>) -> Result<()> {
     let handles = {
         let mut guard = cleanup_tasks.lock().await;
         std::mem::take(&mut *guard)
     };
 
+    join_cleanup_task_handles(handles).await
+}
+
+async fn join_cleanup_task_handles(handles: Vec<JoinHandle<()>>) -> Result<()> {
     for handle in handles {
         handle
             .await
@@ -801,12 +854,38 @@ impl Destination for BigQueryDestination {
                         return Ok(());
                     }
                     let staging = upsert_staging_table_id(table);
+                    info!(
+                        table = table,
+                        staging_table = %staging,
+                        rows = frame.height(),
+                        "ensuring staging table for BigQuery merge"
+                    );
                     self.ensure_table_internal(schema, &staging, false).await?;
+                    info!(
+                        table = table,
+                        staging_table = %staging,
+                        rows = frame.height(),
+                        "staging table ensured for BigQuery merge"
+                    );
                     let result: Result<()> = async {
                         self.append_rows(&staging, schema, frame, Some(pk)).await?;
+                        info!(
+                            table = table,
+                            staging_table = %staging,
+                            rows = frame.height(),
+                            "starting BigQuery merge from staging table"
+                        );
                         self.merge_staging(table, &staging, schema, pk).await
                     }
                     .await;
+                    if result.is_ok() {
+                        info!(
+                            table = table,
+                            staging_table = %staging,
+                            rows = frame.height(),
+                            "completed BigQuery merge from staging table"
+                        );
+                    }
                     self.spawn_drop_table_if_exists(staging).await;
                     result?;
                 } else {
@@ -842,7 +921,7 @@ fn upsert_staging_table_id(table: &str) -> String {
 mod tests {
     use super::{
         BIGQUERY_REQUEST_TIMEOUT, BigQueryDestination, drain_cleanup_task_handles,
-        upsert_staging_table_id,
+        reap_finished_cleanup_task_handles, upsert_staging_table_id,
     };
     use gcloud_bigquery::http::error::Error as BqError;
     use std::future::pending;
@@ -916,5 +995,23 @@ mod tests {
             .expect("cleanup tasks drained");
 
         assert!(finished.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn reap_finished_cleanup_task_handles_discards_completed_handles() {
+        let cleanup_tasks: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
+
+        cleanup_tasks.lock().await.push(tokio::spawn(async {}));
+        cleanup_tasks.lock().await.push(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }));
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        reap_finished_cleanup_task_handles(&cleanup_tasks)
+            .await
+            .expect("finished cleanup handles reaped");
+
+        assert_eq!(cleanup_tasks.lock().await.len(), 1);
     }
 }

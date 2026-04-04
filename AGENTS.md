@@ -9,3 +9,4 @@
 - #![allow(dead_code)] is not allowed. No compiler warnings, no clippy warnings.
 - Never commit broken tests
 - Do not build Linux release artifacts locally. Use GitHub Actions/release automation for Linux binaries unless the user explicitly asks otherwise.
+- CDSync ECS deploys in staging currently use a drain-then-start rollout shape. Expect a brief zero-target window during deploys, typically about 1-3 minutes, before the replacement task reaches `RUNNING` and the admin target becomes healthy. Do not treat that alone as a failure unless the service stays at `runningCount=0`/no healthy target beyond the normal startup window or begins task-restart churn.
