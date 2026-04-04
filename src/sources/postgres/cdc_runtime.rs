@@ -9,6 +9,9 @@ pub(super) struct CdcIdleState {
     pub(super) inflight_apply_empty: bool,
 }
 
+const CDC_RELATION_PENDING_APPLY_TIMEOUT: Duration = Duration::from_secs(300);
+const CDC_RELATION_CHANGE_TIMEOUT: Duration = Duration::from_secs(120);
+
 impl PostgresSource {
     pub(super) async fn load_etl_table_schema(&self, table_id: TableId) -> Result<EtlTableSchema> {
         let row = sqlx::query(
@@ -571,6 +574,10 @@ impl PostgresSource {
                             if !include_tables.contains(&table_id) {
                                 continue;
                             }
+                            info!(
+                                table_id = table_id.into_inner(),
+                                "processing cdc relation change"
+                            );
                             dispatch_cdc_batches(
                                 &mut queued_batches,
                                 &mut pending_table_batches,
@@ -594,15 +601,24 @@ impl PostgresSource {
                                 .clone();
                             let _guard = table_lock.lock().await;
                             if let Some(pending_batch) = pending_table_batches.remove(&table_id) {
-                                dest.write_table_events(table_id, pending_batch.events)
-                                    .await
-                                    .map_err(|err| {
-                                        anyhow::anyhow!(
-                                            "applying buffered CDC table batch for {} before schema update failed: {}",
-                                            table_id.into_inner(),
-                                            err
-                                        )
-                                    })?;
+                                let buffered_event_count = pending_batch.events.len();
+                                await_cdc_timeout(
+                                    format!(
+                                        "applying buffered CDC table batch for {} before schema update",
+                                        table_id.into_inner()
+                                    ),
+                                    CDC_RELATION_PENDING_APPLY_TIMEOUT,
+                                    dest.write_table_events(table_id, pending_batch.events),
+                                )
+                                .await
+                                .map_err(|err| {
+                                    anyhow::anyhow!(
+                                        "applying buffered CDC table batch for {} before schema update failed after {} buffered events: {}",
+                                        table_id.into_inner(),
+                                        buffered_event_count,
+                                        err
+                                    )
+                                })?;
                                 for sequence in pending_batch.sequences {
                                     if let Some(advance) =
                                         watermark_tracker.complete_fragment(sequence)?
@@ -636,8 +652,16 @@ impl PostgresSource {
                                 schema_diff_enabled,
                                 state_handle: state_handle.clone(),
                             };
-                            self.handle_relation_change(table_id, &mut relation_runtime)
-                                .await?;
+                            await_cdc_timeout(
+                                format!("handling relation change for {}", table_id.into_inner()),
+                                CDC_RELATION_CHANGE_TIMEOUT,
+                                self.handle_relation_change(table_id, &mut relation_runtime),
+                            )
+                            .await?;
+                            info!(
+                                table_id = table_id.into_inner(),
+                                "cdc relation change applied"
+                            );
                         }
                         LogicalReplicationMessage::Insert(insert) => {
                             let table_id = TableId::new(insert.rel_id());
