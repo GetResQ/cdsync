@@ -879,6 +879,23 @@ fn spawn_cdc_slot_sampler_tasks(
                     _ = interval.tick() => {
                         let sample = sample_cached_postgres_cdc_slot_state(&connection, &state_store).await;
                         if uses_cdc_batch_load_queue(&connection)
+                            && let Ok(queue_summary) = state_store
+                                .load_cdc_batch_load_queue_summary(&connection.id)
+                                .await
+                        {
+                            crate::telemetry::record_cdc_batch_load_queue_diagnostics(
+                                &connection.id,
+                                queue_summary.pending_jobs.max(0) as u64,
+                                queue_summary.running_jobs.max(0) as u64,
+                                queue_summary.failed_jobs.max(0) as u64,
+                                queue_summary.succeeded_jobs.max(0) as u64,
+                                queue_summary.jobs_per_minute.max(0) as u64,
+                                queue_summary.rows_per_minute.max(0) as u64,
+                                queue_summary.oldest_pending_age_seconds.map(|value| value.max(0) as u64),
+                                queue_summary.oldest_running_age_seconds.map(|value| value.max(0) as u64),
+                            );
+                        }
+                        if uses_cdc_batch_load_queue(&connection)
                             && let Ok(summary) = state_store
                                 .load_cdc_coordinator_summary(
                                     &connection.id,
