@@ -88,6 +88,10 @@ impl BigQueryDestination {
         self.config.batch_load_bucket.is_some() && self.config.emulator_http.is_none()
     }
 
+    pub(crate) fn batch_load_prefix(&self) -> Option<&str> {
+        self.config.batch_load_prefix.as_deref()
+    }
+
     pub async fn new(
         mut config: BigQueryConfig,
         dry_run: bool,
@@ -675,11 +679,11 @@ impl BigQueryDestination {
         Ok(())
     }
 
-    pub(crate) async fn upload_cdc_batch_load_artifact(
+    pub(crate) async fn upload_cdc_batch_load_artifact_with_object_name(
         &self,
-        staging_table: &str,
         schema: &TableSchema,
         frame: &DataFrame,
+        object_name: &str,
     ) -> Result<String> {
         if !self.cdc_batch_load_queue_enabled() {
             anyhow::bail!("CDC batch-load queue requires batch_load_bucket");
@@ -695,17 +699,12 @@ impl BigQueryDestination {
             .context("missing GCS token source for CDC batch-load queue")?;
 
         let schema = with_metadata_schema(schema, &self.metadata);
-        let object_name = batch_load::batch_load_object_name(
-            self.config.batch_load_prefix.as_deref(),
-            staging_table,
-            batch_load::PARQUET_FILE_EXTENSION,
-        );
         let object_uri = format!("gs://{}/{}", bucket, object_name);
         let body = batch_load::parquet_payload(frame, &schema).await?;
         self.upload_batch_load_object(
             token_source,
             bucket,
-            &object_name,
+            object_name,
             batch_load::PARQUET_CONTENT_TYPE,
             body,
         )
@@ -716,17 +715,26 @@ impl BigQueryDestination {
 
     pub(crate) async fn process_cdc_batch_load_job(
         &self,
+        connection_id: &str,
         payload: &CdcBatchLoadJobPayload,
     ) -> Result<()> {
         let target_started_at = std::time::Instant::now();
         let target_span = info_span!(
             "cdc_batch_load_job.ensure_target",
+            connection_id = connection_id,
             table = %payload.target_table
         );
         {
             let _target_span = target_span.enter();
             self.ensure_table(&payload.schema).await?;
         }
+        crate::telemetry::record_cdc_batch_load_stage_duration(
+            connection_id,
+            &payload.target_table,
+            "ensure_target",
+            target_started_at.elapsed().as_secs_f64() * 1000.0,
+            payload.steps.iter().map(|step| step.row_count as u64).sum(),
+        );
         info!(
             table = %payload.target_table,
             duration_ms = target_started_at.elapsed().as_millis() as u64,
@@ -749,8 +757,25 @@ impl BigQueryDestination {
                 "ensuring staging table for queued BigQuery merge"
             );
             let ensure_staging_started_at = std::time::Instant::now();
-            self.ensure_table_internal(&payload.schema, &step.staging_table, false)
-                .await?;
+            let ensure_staging_span = info_span!(
+                "cdc_batch_load_job.ensure_staging",
+                connection_id = connection_id,
+                table = %payload.target_table,
+                staging_table = %step.staging_table,
+                rows = step.row_count
+            );
+            {
+                let _ensure_staging_span = ensure_staging_span.enter();
+                self.ensure_table_internal(&payload.schema, &step.staging_table, false)
+                    .await?;
+            }
+            crate::telemetry::record_cdc_batch_load_stage_duration(
+                connection_id,
+                &payload.target_table,
+                "ensure_staging",
+                ensure_staging_started_at.elapsed().as_secs_f64() * 1000.0,
+                step.row_count as u64,
+            );
             info!(
                 table = %payload.target_table,
                 staging_table = %step.staging_table,
@@ -759,12 +784,29 @@ impl BigQueryDestination {
                 "queued staging table ensured for BigQuery merge"
             );
             let load_started_at = std::time::Instant::now();
-            self.run_load_job(
-                &step.staging_table,
-                &with_metadata_schema(&payload.schema, &self.metadata),
-                &step.object_uri,
-            )
-            .await?;
+            let load_span = info_span!(
+                "cdc_batch_load_job.load_job",
+                connection_id = connection_id,
+                table = %payload.target_table,
+                staging_table = %step.staging_table,
+                rows = step.row_count
+            );
+            {
+                let _load_span = load_span.enter();
+                self.run_load_job(
+                    &step.staging_table,
+                    &with_metadata_schema(&payload.schema, &self.metadata),
+                    &step.object_uri,
+                )
+                .await?;
+            }
+            crate::telemetry::record_cdc_batch_load_stage_duration(
+                connection_id,
+                &payload.target_table,
+                "load_job",
+                load_started_at.elapsed().as_secs_f64() * 1000.0,
+                step.row_count as u64,
+            );
             info!(
                 table = %payload.target_table,
                 staging_table = %step.staging_table,
@@ -779,13 +821,30 @@ impl BigQueryDestination {
                 "starting queued BigQuery merge from staging table"
             );
             let merge_started_at = std::time::Instant::now();
-            self.merge_staging(
+            let merge_span = info_span!(
+                "cdc_batch_load_job.merge",
+                connection_id = connection_id,
+                table = %payload.target_table,
+                staging_table = %step.staging_table,
+                rows = step.row_count
+            );
+            {
+                let _merge_span = merge_span.enter();
+                self.merge_staging(
+                    &payload.target_table,
+                    &step.staging_table,
+                    &payload.schema,
+                    &payload.primary_key,
+                )
+                .await?;
+            }
+            crate::telemetry::record_cdc_batch_load_stage_duration(
+                connection_id,
                 &payload.target_table,
-                &step.staging_table,
-                &payload.schema,
-                &payload.primary_key,
-            )
-            .await?;
+                "merge",
+                merge_started_at.elapsed().as_secs_f64() * 1000.0,
+                step.row_count as u64,
+            );
             info!(
                 table = %payload.target_table,
                 staging_table = %step.staging_table,
@@ -1077,6 +1136,24 @@ async fn insert_all_rows(frame: &DataFrame) -> Result<Vec<Map<String, Value>>> {
 
 pub(crate) fn upsert_staging_table_id(table: &str) -> String {
     format!("{table}_staging_{}", Uuid::new_v4().simple())
+}
+
+pub(crate) fn stable_cdc_staging_table_id(table: &str, job_id: &str, step_kind: &str) -> String {
+    let suffix = job_id.rsplit('_').next().unwrap_or(job_id);
+    format!("{table}_staging_{step_kind}_{suffix}")
+}
+
+pub(crate) fn stable_cdc_batch_load_object_name(
+    prefix: Option<&str>,
+    table: &str,
+    key: &str,
+) -> String {
+    batch_load::batch_load_object_name_for_key(
+        prefix,
+        table,
+        key,
+        batch_load::PARQUET_FILE_EXTENSION,
+    )
 }
 
 #[cfg(test)]

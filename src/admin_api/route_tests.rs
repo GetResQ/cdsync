@@ -4,7 +4,9 @@ use crate::config::{
     MetadataConfig, ObservabilityConfig, PostgresConfig, PostgresTableConfig, SourceConfig,
     StateConfig, StatsConfig, SyncConfig,
 };
-use crate::state::{CdcBatchLoadQueueSummary, ConnectionState, PostgresCdcState};
+use crate::state::{
+    CdcBatchLoadQueueSummary, CdcCoordinatorSummary, ConnectionState, PostgresCdcState,
+};
 use crate::stats::{RunSummary, StatsHandle, TableStatsSnapshot};
 use crate::types::TableCheckpoint;
 use async_trait::async_trait;
@@ -27,6 +29,7 @@ struct FakeStateBackend {
     ping_error: Option<String>,
     load_delay: Option<Duration>,
     batch_load_queue_summary: Option<CdcBatchLoadQueueSummary>,
+    cdc_coordinator_summary: Option<CdcCoordinatorSummary>,
 }
 
 #[async_trait]
@@ -60,6 +63,13 @@ impl AdminStateBackend for FakeStateBackend {
         _connection_id: &str,
     ) -> anyhow::Result<CdcBatchLoadQueueSummary> {
         Ok(self.batch_load_queue_summary.clone().unwrap_or_default())
+    }
+
+    async fn load_cdc_coordinator_summary(
+        &self,
+        _connection_id: &str,
+    ) -> anyhow::Result<CdcCoordinatorSummary> {
+        Ok(self.cdc_coordinator_summary.clone().unwrap_or_default())
     }
 }
 
@@ -95,6 +105,13 @@ impl AdminStateBackend for CountingStateBackend {
         _connection_id: &str,
     ) -> anyhow::Result<CdcBatchLoadQueueSummary> {
         Ok(CdcBatchLoadQueueSummary::default())
+    }
+
+    async fn load_cdc_coordinator_summary(
+        &self,
+        _connection_id: &str,
+    ) -> anyhow::Result<CdcCoordinatorSummary> {
+        Ok(CdcCoordinatorSummary::default())
     }
 }
 
@@ -467,6 +484,7 @@ async fn spawn_admin_server_thread_surfaces_bind_failures_before_returning() -> 
             ping_error: None,
             load_delay: None,
             batch_load_queue_summary: None,
+            cdc_coordinator_summary: None,
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -509,6 +527,7 @@ async fn spawn_admin_server_thread_does_not_wait_for_initial_slot_samples() -> a
             ping_error: None,
             load_delay: Some(Duration::from_millis(300)),
             batch_load_queue_summary: None,
+            cdc_coordinator_summary: None,
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -596,6 +615,7 @@ async fn load_current_run_view_prefers_live_run_snapshot() -> anyhow::Result<()>
             ping_error: None,
             load_delay: None,
             batch_load_queue_summary: None,
+            cdc_coordinator_summary: None,
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -622,6 +642,7 @@ async fn admin_api_stream_route_emits_sse_frames() -> anyhow::Result<()> {
             ping_error: None,
             load_delay: None,
             batch_load_queue_summary: None,
+            cdc_coordinator_summary: None,
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -665,6 +686,7 @@ async fn admin_api_stream_route_emits_cached_cdc_snapshot() -> anyhow::Result<()
             ping_error: None,
             load_delay: None,
             batch_load_queue_summary: None,
+            cdc_coordinator_summary: None,
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -709,6 +731,7 @@ async fn admin_api_in_process_smoke_routes_work() -> anyhow::Result<()> {
             ping_error: None,
             load_delay: None,
             batch_load_queue_summary: None,
+            cdc_coordinator_summary: None,
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -774,6 +797,7 @@ async fn admin_api_in_process_stateful_routes_work() -> anyhow::Result<()> {
             ping_error: None,
             load_delay: None,
             batch_load_queue_summary: None,
+            cdc_coordinator_summary: None,
         }),
         Some(Arc::new(FakeStatsBackend {
             runs,
@@ -893,6 +917,7 @@ async fn admin_api_runs_route_returns_500_when_stats_disabled() -> anyhow::Resul
             ping_error: None,
             load_delay: None,
             batch_load_queue_summary: None,
+            cdc_coordinator_summary: None,
         }),
         None,
     );
@@ -922,6 +947,7 @@ async fn admin_api_rejects_missing_or_wrong_scope_tokens() -> anyhow::Result<()>
             ping_error: None,
             load_delay: None,
             batch_load_queue_summary: None,
+            cdc_coordinator_summary: None,
         }),
         Some(Arc::new(FakeStatsBackend::default())),
     );
@@ -952,6 +978,7 @@ async fn admin_api_accepts_array_audience_tokens() -> anyhow::Result<()> {
             state: test_state(),
             load_delay: None,
             batch_load_queue_summary: None,
+            cdc_coordinator_summary: None,
         }),
         Some(Arc::new(FakeStatsBackend {
             ping_error: None,

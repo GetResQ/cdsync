@@ -81,7 +81,10 @@ fn next_cdc_wait_timeout_uses_pending_fill_deadline_when_sooner() {
     pending.insert(
         TableId::new(1),
         super::cdc_pipeline::PendingTableApplyBatch {
-            sequences: vec![1],
+            fragments: vec![crate::destinations::etl_bigquery::CdcCommitFragmentMeta {
+                sequence: 1,
+                commit_lsn: "0/1".to_string(),
+            }],
             events: Vec::new(),
             event_count: 1,
             first_buffered_at: Instant::now() - Duration::from_millis(1_500),
@@ -104,7 +107,10 @@ fn next_cdc_wait_timeout_falls_back_to_idle_when_apply_slots_are_full() {
     pending.insert(
         TableId::new(1),
         super::cdc_pipeline::PendingTableApplyBatch {
-            sequences: vec![1],
+            fragments: vec![crate::destinations::etl_bigquery::CdcCommitFragmentMeta {
+                sequence: 1,
+                commit_lsn: "0/1".to_string(),
+            }],
             events: Vec::new(),
             event_count: 1,
             first_buffered_at: Instant::now() - Duration::from_secs(3),
@@ -127,7 +133,10 @@ fn cdc_fill_deadline_reached_tracks_pending_batch_age() {
     pending.insert(
         TableId::new(1),
         super::cdc_pipeline::PendingTableApplyBatch {
-            sequences: vec![1],
+            fragments: vec![crate::destinations::etl_bigquery::CdcCommitFragmentMeta {
+                sequence: 1,
+                commit_lsn: "0/1".to_string(),
+            }],
             events: Vec::new(),
             event_count: 1,
             first_buffered_at: Instant::now() - Duration::from_secs(3),
@@ -572,13 +581,9 @@ fn relation_change_skips_destination_ensure_when_schema_is_unchanged() {
 async fn drain_one_cdc_work_advances_immediate_dispatch_without_completion_future() {
     let mut inflight_dispatch: FuturesUnordered<CdcDispatchFuture> = FuturesUnordered::new();
     let mut inflight_apply: FuturesUnordered<CdcApplyFuture> = FuturesUnordered::new();
-    let mut watermark_tracker = CdcWatermarkTracker::default();
     let mut active_table_applies = HashSet::new();
     let table_id = TableId::new(42);
     active_table_applies.insert(table_id);
-    let commit_lsn = etl::types::PgLsn::from(1234_u64);
-
-    watermark_tracker.register_commit(0, commit_lsn, HashMap::new(), 0, 1);
     inflight_dispatch.push(Box::pin(async move {
         Ok(CdcDispatchResult::Immediate(CdcApplyFragmentAck {
             sequences: vec![0],
@@ -591,7 +596,6 @@ async fn drain_one_cdc_work_advances_immediate_dispatch_without_completion_futur
         super::drain_one_cdc_work(
             &mut inflight_dispatch,
             &mut inflight_apply,
-            &mut watermark_tracker,
             &mut active_table_applies,
         ),
     )
@@ -600,7 +604,7 @@ async fn drain_one_cdc_work_advances_immediate_dispatch_without_completion_futur
     .expect("drain_one_cdc_work failed");
 
     assert_eq!(advances.len(), 1);
-    assert_eq!(advances[0].commit_lsn, commit_lsn);
+    assert_eq!(advances[0].sequences, vec![0]);
     assert!(active_table_applies.is_empty());
 }
 

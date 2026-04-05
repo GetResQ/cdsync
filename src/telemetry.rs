@@ -66,6 +66,9 @@ struct ReplicationMetrics {
     reconcile_mismatches_total: Counter<u64>,
     sync_runs_total: Counter<u64>,
     sync_run_duration_ms: Histogram<f64>,
+    cdc_batch_load_jobs_total: Counter<u64>,
+    cdc_batch_load_job_duration_ms: Histogram<f64>,
+    cdc_batch_load_stage_duration_ms: Histogram<f64>,
 }
 
 static METRICS: OnceLock<ReplicationMetrics> = OnceLock::new();
@@ -247,6 +250,42 @@ pub fn record_sync_run(connection_id: &str, status: &str, duration_ms: f64) {
     }
 }
 
+pub fn record_cdc_batch_load_job(connection_id: &str, table: &str, status: &str, duration_ms: f64) {
+    let metrics = metrics();
+    let attrs = [
+        KeyValue::new("connection_id", connection_id.to_string()),
+        KeyValue::new("table", table.to_string()),
+        KeyValue::new("status", status.to_string()),
+    ];
+    metrics.cdc_batch_load_jobs_total.add(1, &attrs);
+    if duration_ms.is_finite() && duration_ms >= 0.0 {
+        metrics
+            .cdc_batch_load_job_duration_ms
+            .record(duration_ms, &attrs);
+    }
+}
+
+pub fn record_cdc_batch_load_stage_duration(
+    connection_id: &str,
+    table: &str,
+    stage: &str,
+    duration_ms: f64,
+    rows: u64,
+) {
+    let metrics = metrics();
+    let attrs = [
+        KeyValue::new("connection_id", connection_id.to_string()),
+        KeyValue::new("table", table.to_string()),
+        KeyValue::new("stage", stage.to_string()),
+        KeyValue::new("rows", rows as i64),
+    ];
+    if duration_ms.is_finite() && duration_ms >= 0.0 {
+        metrics
+            .cdc_batch_load_stage_duration_ms
+            .record(duration_ms, &attrs);
+    }
+}
+
 fn metrics() -> &'static ReplicationMetrics {
     METRICS.get_or_init(|| {
         let meter: Meter = global::meter("cdsync");
@@ -276,6 +315,15 @@ fn metrics() -> &'static ReplicationMetrics {
                 .build(),
             sync_runs_total: meter.u64_counter("cdsync_sync_runs_total").build(),
             sync_run_duration_ms: meter.f64_histogram("cdsync_sync_run_duration_ms").build(),
+            cdc_batch_load_jobs_total: meter
+                .u64_counter("cdsync_cdc_batch_load_jobs_total")
+                .build(),
+            cdc_batch_load_job_duration_ms: meter
+                .f64_histogram("cdsync_cdc_batch_load_job_duration_ms")
+                .build(),
+            cdc_batch_load_stage_duration_ms: meter
+                .f64_histogram("cdsync_cdc_batch_load_stage_duration_ms")
+                .build(),
         }
     })
 }

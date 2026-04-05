@@ -7,7 +7,9 @@ use crate::config::{
     SalesforceConfig, SourceConfig, SyncConfig,
 };
 use crate::runner::ShutdownSignal;
-use crate::state::{CdcBatchLoadQueueSummary, ConnectionState, SyncState, SyncStateStore};
+use crate::state::{
+    CdcBatchLoadQueueSummary, CdcCoordinatorSummary, ConnectionState, SyncState, SyncStateStore,
+};
 use crate::stats::{
     RunStatsSnapshot, RunSummary, StatsDb, TableStatsSnapshot, live_run_snapshot, summarize_run,
 };
@@ -116,6 +118,10 @@ trait AdminStateBackend: Send + Sync {
         &self,
         connection_id: &str,
     ) -> anyhow::Result<CdcBatchLoadQueueSummary>;
+    async fn load_cdc_coordinator_summary(
+        &self,
+        connection_id: &str,
+    ) -> anyhow::Result<CdcCoordinatorSummary>;
 }
 
 #[async_trait]
@@ -151,6 +157,13 @@ impl AdminStateBackend for SyncStateStore {
         connection_id: &str,
     ) -> anyhow::Result<CdcBatchLoadQueueSummary> {
         SyncStateStore::load_cdc_batch_load_queue_summary(self, connection_id).await
+    }
+
+    async fn load_cdc_coordinator_summary(
+        &self,
+        connection_id: &str,
+    ) -> anyhow::Result<CdcCoordinatorSummary> {
+        SyncStateStore::load_cdc_coordinator_summary(self, connection_id).await
     }
 }
 
@@ -387,6 +400,7 @@ struct ProgressResponse {
     runtime: ConnectionRuntime,
     cdc: ConnectionCdcSnapshot,
     batch_load_queue: Option<CdcBatchLoadQueueSummary>,
+    cdc_coordinator: Option<CdcCoordinatorSummary>,
     tables: Vec<TableProgress>,
 }
 
@@ -1181,6 +1195,16 @@ async fn progress(
     } else {
         None
     };
+    let cdc_coordinator = if uses_cdc_batch_load_queue(config) {
+        Some(
+            state
+                .state_store
+                .load_cdc_coordinator_summary(&connection_id)
+                .await?,
+        )
+    } else {
+        None
+    };
 
     Ok(Json(ProgressResponse {
         connection_id,
@@ -1189,6 +1213,7 @@ async fn progress(
         runtime,
         cdc,
         batch_load_queue,
+        cdc_coordinator,
         tables,
     }))
 }

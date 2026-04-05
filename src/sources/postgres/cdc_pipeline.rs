@@ -32,12 +32,32 @@ pub(super) struct CdcWatermarkAdvance {
     pub(super) commit_lsn: etl::types::PgLsn,
     pub(super) stats: HashMap<TableId, usize>,
     pub(super) extract_ms: u64,
+    pub(super) next_sequence_to_ack: u64,
 }
 
 #[derive(Default)]
 pub(super) struct CdcWatermarkTracker {
     pub(super) next_sequence: u64,
     pub(super) commits: BTreeMap<u64, CommitTrackerEntry>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct CdcCoordinatorRuntimeState {
+    pub(super) inflight_commits: usize,
+    pub(super) next_sequence_to_ack: u64,
+}
+
+pub(super) enum CdcCoordinatorCommand {
+    RegisterCommit {
+        sequence: u64,
+        commit_lsn: etl::types::PgLsn,
+        stats: HashMap<TableId, usize>,
+        extract_ms: u64,
+        fragment_count: usize,
+    },
+    CompleteFragments {
+        sequences: Vec<u64>,
+    },
 }
 
 pub(super) struct CdcWatermarkRuntime<'a> {
@@ -48,7 +68,7 @@ pub(super) struct CdcWatermarkRuntime<'a> {
 }
 
 pub(super) struct PendingTableApplyBatch {
-    pub(super) sequences: Vec<u64>,
+    pub(super) fragments: Vec<crate::destinations::etl_bigquery::CdcCommitFragmentMeta>,
     pub(super) events: Vec<Event>,
     pub(super) event_count: usize,
     pub(super) first_buffered_at: Instant,
@@ -127,8 +147,57 @@ impl CdcWatermarkTracker {
             commit_lsn,
             stats,
             extract_ms,
+            next_sequence_to_ack: self.next_sequence,
         })
     }
+}
+
+pub(super) fn spawn_cdc_coordinator() -> (
+    mpsc::UnboundedSender<CdcCoordinatorCommand>,
+    mpsc::UnboundedReceiver<CdcWatermarkAdvance>,
+    watch::Receiver<CdcCoordinatorRuntimeState>,
+    tokio::task::JoinHandle<Result<()>>,
+) {
+    let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+    let (advance_tx, advance_rx) = mpsc::unbounded_channel();
+    let (state_tx, state_rx) = watch::channel(CdcCoordinatorRuntimeState::default());
+    let task = tokio::spawn(async move {
+        let mut tracker = CdcWatermarkTracker::default();
+        while let Some(command) = command_rx.recv().await {
+            match command {
+                CdcCoordinatorCommand::RegisterCommit {
+                    sequence,
+                    commit_lsn,
+                    stats,
+                    extract_ms,
+                    fragment_count,
+                } => {
+                    tracker.register_commit(
+                        sequence,
+                        commit_lsn,
+                        stats,
+                        extract_ms,
+                        fragment_count,
+                    );
+                }
+                CdcCoordinatorCommand::CompleteFragments { sequences } => {
+                    for sequence in sequences {
+                        if let Some(advance) = tracker.complete_fragment(sequence)?
+                            && advance_tx.send(advance).is_err()
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            let _ = state_tx.send(CdcCoordinatorRuntimeState {
+                inflight_commits: tracker.inflight_commits(),
+                next_sequence_to_ack: tracker.next_sequence,
+            });
+        }
+        Ok(())
+    });
+    (command_tx, advance_rx, state_rx, task)
 }
 
 pub(super) fn split_commit_events_by_table(events: Vec<Event>) -> Vec<CdcTableApplyBatch> {
@@ -181,11 +250,11 @@ pub(super) fn dispatch_cdc_batches(
     queued_batches: &mut VecDeque<CommittedCdcBatch>,
     pending_table_batches: &mut HashMap<TableId, PendingTableApplyBatch>,
     inflight_dispatch: &mut FuturesUnordered<CdcDispatchFuture>,
-    watermark_tracker: &mut CdcWatermarkTracker,
+    coordinator_tx: &mpsc::UnboundedSender<CdcCoordinatorCommand>,
     dest: &EtlBigQueryDestination,
     coordination: &mut CdcApplyCoordination<'_>,
     config: CdcDispatchConfig,
-) {
+) -> Result<()> {
     while let Some(batch) = queued_batches.pop_front() {
         let table_count = batch.table_batches.len();
         let event_count: usize = batch
@@ -202,13 +271,15 @@ pub(super) fn dispatch_cdc_batches(
             fragment_count,
             "cdc commit queued for dispatch"
         );
-        watermark_tracker.register_commit(
-            batch.sequence,
-            batch.commit_lsn,
-            batch.stats,
-            batch.extract_ms,
-            fragment_count,
-        );
+        coordinator_tx
+            .send(CdcCoordinatorCommand::RegisterCommit {
+                sequence: batch.sequence,
+                commit_lsn: batch.commit_lsn,
+                stats: batch.stats.clone(),
+                extract_ms: batch.extract_ms,
+                fragment_count,
+            })
+            .map_err(|_| anyhow::anyhow!("CDC coordinator task stopped"))?;
 
         if batch.table_batches.is_empty() {
             let sequences = vec![batch.sequence];
@@ -226,12 +297,17 @@ pub(super) fn dispatch_cdc_batches(
             let pending = pending_table_batches
                 .entry(table_batch.table_id)
                 .or_insert_with(|| PendingTableApplyBatch {
-                    sequences: Vec::new(),
+                    fragments: Vec::new(),
                     events: Vec::new(),
                     event_count: 0,
                     first_buffered_at: Instant::now(),
                 });
-            pending.sequences.push(batch.sequence);
+            pending
+                .fragments
+                .push(crate::destinations::etl_bigquery::CdcCommitFragmentMeta {
+                    sequence: batch.sequence,
+                    commit_lsn: batch.commit_lsn.to_string(),
+                });
             pending.event_count += event_count;
             pending.events.extend(table_batch.events);
         }
@@ -245,7 +321,11 @@ pub(super) fn dispatch_cdc_batches(
                 || pending.event_count >= config.apply_batch_size
                 || now.duration_since(pending.first_buffered_at) >= config.max_fill;
             should_flush.then_some((
-                pending.sequences.first().copied().unwrap_or_default(),
+                pending
+                    .fragments
+                    .first()
+                    .map(|fragment| fragment.sequence)
+                    .unwrap_or_default(),
                 *table_id,
             ))
         })
@@ -268,8 +348,9 @@ pub(super) fn dispatch_cdc_batches(
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
         let apply_dest = dest.clone();
-        let sequences = pending.sequences;
+        let fragments = pending.fragments;
         let events = pending.events;
+        let sequences: Vec<u64> = fragments.iter().map(|fragment| fragment.sequence).collect();
         let sequence_count = sequences.len();
         let event_count = events.len();
         coordination.active_table_applies.insert(table_id);
@@ -292,7 +373,7 @@ pub(super) fn dispatch_cdc_batches(
                 sequence_count, event_count, "acquired cdc table apply lock"
             );
             match apply_dest
-                .dispatch_table_events(table_id, events, sequences[0])
+                .dispatch_table_events(table_id, events, fragments)
                 .await
                 .map_err(|err| {
                     anyhow::anyhow!(
@@ -336,20 +417,20 @@ pub(super) fn dispatch_cdc_batches(
             }
         }));
     }
+    Ok(())
 }
 
 pub(super) fn handle_cdc_dispatch_result(
     result: Option<Result<CdcDispatchResult>>,
-    watermark_tracker: &mut CdcWatermarkTracker,
     inflight_completion: &mut FuturesUnordered<CdcApplyFuture>,
     active_table_applies: &mut HashSet<TableId>,
-) -> Result<Vec<CdcWatermarkAdvance>> {
+) -> Result<Vec<CdcApplyFragmentAck>> {
     let Some(result) = result else {
         return Ok(Vec::new());
     };
     match result? {
         CdcDispatchResult::Immediate(ack) => {
-            handle_cdc_apply_result(Some(Ok(ack)), watermark_tracker, active_table_applies)
+            handle_cdc_apply_result(Some(Ok(ack)), active_table_applies)
         }
         CdcDispatchResult::Deferred(deferred) => {
             if let Some(table_id) = deferred.released_table {
@@ -363,9 +444,8 @@ pub(super) fn handle_cdc_dispatch_result(
 
 pub(super) fn handle_cdc_apply_result(
     result: Option<Result<CdcApplyFragmentAck>>,
-    watermark_tracker: &mut CdcWatermarkTracker,
     active_table_applies: &mut HashSet<TableId>,
-) -> Result<Vec<CdcWatermarkAdvance>> {
+) -> Result<Vec<CdcApplyFragmentAck>> {
     let Some(result) = result else {
         return Ok(Vec::new());
     };
@@ -378,54 +458,36 @@ pub(super) fn handle_cdc_apply_result(
     if let Some(table_id) = ack.released_table {
         active_table_applies.remove(&table_id);
     }
-    let mut advances = Vec::new();
-    for sequence in ack.sequences {
-        if let Some(advance) = watermark_tracker.complete_fragment(sequence)? {
-            advances.push(advance);
-        }
-    }
-    Ok(advances)
+    Ok(vec![ack])
 }
 
 pub(super) async fn drain_one_cdc_apply(
     inflight_apply: &mut FuturesUnordered<CdcApplyFuture>,
-    watermark_tracker: &mut CdcWatermarkTracker,
     active_table_applies: &mut HashSet<TableId>,
-) -> Result<Vec<CdcWatermarkAdvance>> {
+) -> Result<Vec<CdcApplyFragmentAck>> {
     let result = inflight_apply.next().await;
-    handle_cdc_apply_result(result, watermark_tracker, active_table_applies)
+    handle_cdc_apply_result(result, active_table_applies)
 }
 
 pub(super) async fn drain_one_cdc_work(
     inflight_dispatch: &mut FuturesUnordered<CdcDispatchFuture>,
     inflight_apply: &mut FuturesUnordered<CdcApplyFuture>,
-    watermark_tracker: &mut CdcWatermarkTracker,
     active_table_applies: &mut HashSet<TableId>,
-) -> Result<Vec<CdcWatermarkAdvance>> {
+) -> Result<Vec<CdcApplyFragmentAck>> {
     if inflight_dispatch.is_empty() {
-        return drain_one_cdc_apply(inflight_apply, watermark_tracker, active_table_applies).await;
+        return drain_one_cdc_apply(inflight_apply, active_table_applies).await;
     }
     if inflight_apply.is_empty() {
         let result = inflight_dispatch.next().await;
-        return handle_cdc_dispatch_result(
-            result,
-            watermark_tracker,
-            inflight_apply,
-            active_table_applies,
-        );
+        return handle_cdc_dispatch_result(result, inflight_apply, active_table_applies);
     }
 
     tokio::select! {
         result = inflight_dispatch.next() => {
-            handle_cdc_dispatch_result(
-                result,
-                watermark_tracker,
-                inflight_apply,
-                active_table_applies,
-            )
+            handle_cdc_dispatch_result(result, inflight_apply, active_table_applies)
         }
         result = inflight_apply.next() => {
-            handle_cdc_apply_result(result, watermark_tracker, active_table_applies)
+            handle_cdc_apply_result(result, active_table_applies)
         }
     }
 }
@@ -435,7 +497,7 @@ pub(super) fn pending_cdc_commit_count(
 ) -> usize {
     pending_table_batches
         .values()
-        .map(|pending| pending.sequences.len())
+        .map(|pending| pending.fragments.len())
         .sum()
 }
 
@@ -488,10 +550,22 @@ pub(super) async fn apply_cdc_watermark_advance(
         .get_or_insert_with(Default::default);
     cdc_state.last_lsn = Some(last_flushed_lsn.to_string());
     if let Some(state_handle) = runtime.state_handle {
-        match timeout(
-            CDC_STATE_SAVE_TIMEOUT,
-            state_handle.save_postgres_cdc_state(cdc_state),
-        )
+        match timeout(CDC_STATE_SAVE_TIMEOUT, async {
+            state_handle.save_postgres_cdc_state(cdc_state).await?;
+            let mut watermark_state = state_handle
+                .load_cdc_watermark_state()
+                .await?
+                .unwrap_or_default();
+            watermark_state.next_sequence_to_ack = advance.next_sequence_to_ack;
+            watermark_state.last_received_lsn = Some(last_received_lsn.to_string());
+            watermark_state.last_flushed_lsn = Some(last_flushed_lsn.to_string());
+            watermark_state.last_persisted_lsn = Some(last_flushed_lsn.to_string());
+            watermark_state.updated_at = Some(chrono::Utc::now());
+            state_handle
+                .save_cdc_watermark_state(&watermark_state)
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })
         .await
         {
             Ok(Ok(())) => {}

@@ -311,6 +311,19 @@ pub(super) fn batch_load_object_name(
     }
 }
 
+pub(super) fn batch_load_object_name_for_key(
+    prefix: Option<&str>,
+    table_id: &str,
+    key: &str,
+    extension: &str,
+) -> String {
+    let base = format!("{}_{}.{}", table_id.replace('.', "_"), key, extension);
+    match prefix.map(str::trim).filter(|prefix| !prefix.is_empty()) {
+        Some(prefix) => format!("{}/{}", prefix.trim_end_matches('/'), base),
+        None => base,
+    }
+}
+
 fn dataframe_to_parquet_bytes(frame: &DataFrame, schema: &TableSchema) -> Result<Vec<u8>> {
     let mut parquet_frame = parquet_batch_load_frame(frame, schema)?;
     let mut cursor = Cursor::new(Vec::new());
