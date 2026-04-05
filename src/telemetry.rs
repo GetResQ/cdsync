@@ -322,7 +322,9 @@ pub fn record_cdc_batch_load_queue_diagnostics(
     metrics
         .cdc_batch_load_running_jobs
         .record(running_jobs, &attrs);
-    metrics.cdc_batch_load_failed_jobs.record(failed_jobs, &attrs);
+    metrics
+        .cdc_batch_load_failed_jobs
+        .record(failed_jobs, &attrs);
     metrics
         .cdc_batch_load_succeeded_jobs
         .record(succeeded_jobs, &attrs);
