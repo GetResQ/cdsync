@@ -81,29 +81,29 @@ but the code still makes those concerns too easy to blur together.
 | persist jobs       |                        |                          |
 | persist fragments   \                       |                          |
 | publish work ------->\----------------------+                          |
-+----------+-----------+ \                                                 
-           |              \                                                
-           |               \                                              
-           |                v                                             
-           |        +-------+--------+                                    
-           |        |   Consumer     |                                    
-           |        | worker pool    |                                    
-           |        | claim jobs     |                                    
-           |        | ensure target  |                                    
-           |        | ensure staging |                                    
-           |        | load job       |                                    
-           |        | merge          |                                    
-           |        | mark job done  |                                    
-           |        +-------+--------+                                    
-           |                |                                             
-           |                v                                             
-           |        +-------+--------+                                    
-           +------->| Coordinator    |                                    
-                    | complete seqs  |                                    
-                    | head-of-line   |                                    
-                    | advance WAL    |                                    
-                    | persist lastlsn|                                    
-                    +----------------+                                    
++----------+-----------+ \
+           |              \
+           |               \
+           |                v
+           |        +-------+--------+
+           |        |   Consumer     |
+           |        | worker pool    |
+           |        | claim jobs     |
+           |        | ensure target  |
+           |        | ensure staging |
+           |        | load job       |
+           |        | merge          |
+           |        | mark job done  |
+           |        +-------+--------+
+           |                |
+           |                v
+           |        +-------+--------+
+           +------->| Coordinator    |
+                    | complete seqs  |
+                    | head-of-line   |
+                    | advance WAL    |
+                    | persist lastlsn|
+                    +----------------+
 ```
 
 This is still one process. The separation is logical:
